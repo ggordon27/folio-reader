@@ -172,18 +172,12 @@ def init_db():
                             "UPDATE books SET folder_path = ? WHERE id = ? AND (folder_path IS NULL OR folder_path = '')",
                             (fp, bid),
                         )
-                    conn.execute(
-                        """
-                        UPDATE books
-                        SET title = COALESCE(NULLIF(?, ''), title),
-                            author = COALESCE(NULLIF(?, ''), author),
-                            publisher = COALESCE(NULLIF(?, ''), publisher)
-                        WHERE id = ? AND COALESCE(meta_verified, 0) = 0 AND (author IS NULL OR author = '')
-                        """,
-                        (m.get("title", ""), m.get("author", ""), m.get("publisher", ""), bid),
-                    )
             except Exception:
                 pass
+        reverify_row = conn.execute("SELECT value FROM settings WHERE key = 'opf_reverify_v2'").fetchone()
+        if not reverify_row:
+            conn.execute("UPDATE books SET meta_verified = 0")
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('opf_reverify_v2', '1')")
     conn.close()
 
 
@@ -874,7 +868,7 @@ _META_ENRICH_LOCK = threading.Lock()
 _META_ENRICH_RUNNING = False
 
 
-def start_background_metadata_enrichment(limit: int = 1000):
+def start_background_metadata_enrichment(limit: int = 5000):
     """Extracts true OPF title/author/publisher in /tmp for unverified books without caching them."""
     global _META_ENRICH_RUNNING
     with _META_ENRICH_LOCK:
@@ -2819,7 +2813,7 @@ def main():
     init_db()
     start_periodic_drive_sync()
     if has_drive_oauth():
-        start_background_metadata_enrichment(limit=1000)
+        start_background_metadata_enrichment(limit=5000)
     port = int(os.environ.get("PORT", 8765))
     host = os.environ.get("HOST", "0.0.0.0" if (os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT")) else "127.0.0.1")
     server = ThreadingHTTPServer((host, port), ReaderRequestHandler)
