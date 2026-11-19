@@ -638,22 +638,26 @@ def parse_epub_structure(epub_path: Path, extract_dir: Path) -> dict:
     }
 
 
-IGNORED_FOLDER_IDS = {"1jN3X4CNW5vpvNyu47TR32kUJFPmTZRba"}  # ElevenReader epubs
-IGNORED_FOLDER_NAMES = {"elevenreader epubs", "elevenreader"}
+IGNORED_FOLDER_IDS = {
+    "1jN3X4CNW5vpvNyu47TR32kUJFPmTZRba",  # ElevenReader epubs
+    "1pY3dK-t0C9_5v9hcIuzeyCNLN3Oog6oM",  # tts-epub converter2/output_epubs
+    "18ilVVqJHmQa5y-96tCN40uY5uCP7Oj2W",  # tts-epub converter2
+}
+IGNORED_FOLDER_NAMES = {"elevenreader epubs", "elevenreader", "epub_out", "output_epubs", "tts-epub"}
 
 
-def is_ignored_epub(item_or_book: dict) -> bool:
+def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: set = None) -> bool:
     parent_id = (item_or_book.get("parent_folder_id") or "").strip()
     if not parent_id and item_or_book.get("parents"):
         parent_id = item_or_book["parents"][0]
-    if parent_id in IGNORED_FOLDER_IDS:
+    if parent_id in IGNORED_FOLDER_IDS or (extra_ignored_folder_ids and parent_id in extra_ignored_folder_ids):
         return True
     folder_path = (item_or_book.get("folder_path") or "").lower().strip()
     for ignored_name in IGNORED_FOLDER_NAMES:
         if ignored_name in folder_path:
             return True
     name = (item_or_book.get("name") or "").lower().strip()
-    if "-elevenreader.epub" in name or "_elevenreader.epub" in name:
+    if "elevenreader" in name or "(tts)" in name or "-tts.epub" in name or "_tts.epub" in name:
         return True
     return False
 
@@ -677,8 +681,25 @@ def sync_library_from_drive() -> list:
         except Exception:
             pass
 
-    # Refresh ignored folder file list via gdrive when available
-    if not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
+    # Refresh ignored folder file list via Drive REST API or local gdrive
+    dynamic_ignored_folders = set(IGNORED_FOLDER_IDS)
+    if has_drive_oauth():
+        try:
+            q_folders = (
+                "trashed = false and mimeType = 'application/vnd.google-apps.folder' and "
+                "(name = 'ElevenReader epubs' or name = 'epub_out' or name = 'output_epubs' "
+                "or name = 'tts-epub converter' or name = 'tts-epub converter2')"
+            )
+            f_data = drive_rest_json(
+                "https://www.googleapis.com/drive/v3/files?"
+                + urllib.parse.urlencode({"q": q_folders, "fields": "files(id,name)", "pageSize": "100"})
+            )
+            for f_item in f_data.get("files") or []:
+                if f_item.get("id"):
+                    dynamic_ignored_folders.add(f_item["id"])
+        except Exception:
+            pass
+    elif os.path.exists(GDRIVE_BIN):
         for ig_folder_id in IGNORED_FOLDER_IDS:
             ls_proc = run_gdrive(["readonly", "ls", ig_folder_id, "--json"], timeout=30)
             if ls_proc.returncode == 0 and ls_proc.stdout.strip():
@@ -755,7 +776,7 @@ def sync_library_from_drive() -> list:
                 parents = item.get("parents") or []
                 parent_id = parents[0] if parents else ""
                 folder_path = item.get("folder_path") or folder_map.get(name, "")
-                if is_ignored_epub({"parent_folder_id": parent_id, "folder_path": folder_path, "name": name}):
+                if is_ignored_epub({"parent_folder_id": parent_id, "folder_path": folder_path, "name": name}, dynamic_ignored_folders):
                     conn.execute("DELETE FROM books WHERE id = ?", (file_id,))
                     continue
 
