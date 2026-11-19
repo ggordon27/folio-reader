@@ -156,7 +156,7 @@ def init_db():
             except Exception:
                 pass
         conn.execute(
-            "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%'"
+            "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%' OR id = '1Xx-8moh8UVB9Y_BVTNBkR2uLIbhIjvG0' OR LOWER(name) LIKE '%process-tracing methods%'"
         )
         meta_file = BASE_DIR / "metadata_seed.json"
         if meta_file.exists():
@@ -698,9 +698,12 @@ def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: set = None) ->
     name = (item_or_book.get("name") or "").lower().strip()
     title = (item_or_book.get("title") or "").lower().strip()
     if (
-        name == "book.epub"
+        item_or_book.get("id") == "1Xx-8moh8UVB9Y_BVTNBkR2uLIbhIjvG0"
+        or name == "book.epub"
         or "getting started with adobe digital editions" in name
         or "getting started with adobe digital editions" in title
+        or "process-tracing methods" in name
+        or "process-tracing methods" in title
         or "elevenreader" in name
         or "(tts)" in name
         or "-tts.epub" in name
