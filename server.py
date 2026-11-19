@@ -657,7 +657,7 @@ def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: set = None) ->
         if ignored_name in folder_path:
             return True
     name = (item_or_book.get("name") or "").lower().strip()
-    if "elevenreader" in name or "(tts)" in name or "-tts.epub" in name or "_tts.epub" in name:
+    if name == "book.epub" or "elevenreader" in name or "(tts)" in name or "-tts.epub" in name or "_tts.epub" in name:
         return True
     return False
 
@@ -905,7 +905,7 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
 
         # Also fetch parent folder ID if missing
         parent_folder_id = book.get("parent_folder_id") or ""
-        if not parent_folder_id:
+        if not parent_folder_id and not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
             info_proc = run_gdrive(["readonly", "info", book_id, "--json"], timeout=30)
             if info_proc.returncode == 0:
                 try:
@@ -983,18 +983,31 @@ def try_import_annotations_from_drive(book_id: str, epub_name: str):
         conn.close()
 
     comp_name = companion_filename_for(epub_name, ".annotations.json")
-    proc = run_gdrive(["readonly", "search", "--name-exact", comp_name, "--json"], timeout=30)
-    if proc.returncode != 0:
-        return
     try:
-        files = json.loads(proc.stdout or "[]")
-        if not files:
-            return
-        comp_id = files[0]["id"]
+        comp_id = ""
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
             tmp_path = tf.name
-        dl = run_gdrive(["readonly", "download", comp_id, "--out", tmp_path], timeout=30)
-        if dl.returncode == 0 and os.path.exists(tmp_path):
+        downloaded_ok = False
+        if has_drive_oauth():
+            comp_id = drive_rest_find_by_name(comp_name)
+            if not comp_id:
+                return
+            drive_rest_download(comp_id, Path(tmp_path))
+            downloaded_ok = os.path.exists(tmp_path)
+        elif os.path.exists(GDRIVE_BIN):
+            proc = run_gdrive(["readonly", "search", "--name-exact", comp_name, "--json"], timeout=30)
+            if proc.returncode != 0:
+                return
+            files = json.loads(proc.stdout or "[]")
+            if not files:
+                return
+            comp_id = files[0]["id"]
+            dl = run_gdrive(["readonly", "download", comp_id, "--out", tmp_path], timeout=30)
+            downloaded_ok = dl.returncode == 0 and os.path.exists(tmp_path)
+        else:
+            return
+
+        if downloaded_ok:
             data = json.loads(Path(tmp_path).read_text(encoding="utf-8"))
             anns = data.get("annotations", [])
             conn = get_db()
@@ -1148,7 +1161,7 @@ def sync_annotations_to_drive(book_id: str) -> dict:
         conn.close()
 
     parent_id = book.get("parent_folder_id") or ""
-    if not parent_id:
+    if not parent_id and not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
         info_proc = run_gdrive(["readonly", "info", book_id, "--json"], timeout=30)
         if info_proc.returncode == 0:
             try:
