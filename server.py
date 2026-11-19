@@ -156,6 +156,26 @@ def init_db():
         conn.execute(
             "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%'"
         )
+        meta_file = BASE_DIR / "metadata_seed.json"
+        if meta_file.exists():
+            try:
+                meta_map = json.loads(meta_file.read_text(encoding="utf-8"))
+                for bid, m in meta_map.items():
+                    if not bid or not isinstance(m, dict):
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE books
+                        SET title = COALESCE(NULLIF(?, ''), title),
+                            author = COALESCE(NULLIF(?, ''), author),
+                            publisher = COALESCE(NULLIF(?, ''), publisher),
+                            folder_path = COALESCE(NULLIF(?, ''), folder_path)
+                        WHERE id = ? AND (author IS NULL OR author = '' OR folder_path IS NULL OR folder_path = '')
+                        """,
+                        (m.get("title", ""), m.get("author", ""), m.get("publisher", ""), m.get("folder_path", ""), bid),
+                    )
+            except Exception:
+                pass
     conn.close()
 
 
@@ -831,30 +851,60 @@ def sync_library_from_drive() -> list:
                         """,
                         (file_id, name, clean_title, "", size, mod_time, web_link, parent_id, folder_path),
                     )
-        # Extract official OPF metadata for any newly added books missing author (up to 15 per sync call)
-        unmeta_rows = conn.execute("SELECT id FROM books WHERE (author = '' OR author IS NULL) LIMIT 15").fetchall()
-        for ur in unmeta_rows:
-            bid = ur["id"]
-            tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
-            downloaded_ok = False
-            if has_drive_oauth():
+        # Enrich any newly added books missing author in a background thread (without caching the full EPUB)
+        start_background_metadata_enrichment(limit=60)
+        return get_all_books()
+    finally:
+        conn.close()
+
+
+_META_ENRICH_LOCK = threading.Lock()
+_META_ENRICH_RUNNING = False
+
+
+def start_background_metadata_enrichment(limit: int = 60):
+    """Extracts OPF title/author/publisher in /tmp for uncached books without blocking requests."""
+    global _META_ENRICH_RUNNING
+    with _META_ENRICH_LOCK:
+        if _META_ENRICH_RUNNING:
+            return
+        _META_ENRICH_RUNNING = True
+
+    def _worker():
+        global _META_ENRICH_RUNNING
+        try:
+            conn = get_db()
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM books WHERE (author = '' OR author IS NULL) ORDER BY modified_time DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                book_ids = [r["id"] for r in rows]
+            finally:
+                conn.close()
+
+            import extract_meta_helper
+            for bid in book_ids:
+                tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
                 try:
-                    drive_rest_download(bid, tmp_epub)
-                    downloaded_ok = tmp_epub.exists()
-                except Exception:
                     downloaded_ok = False
-            elif os.path.exists(GDRIVE_BIN):
-                dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
-                downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
-            if downloaded_ok:
-                try:
-                    import extract_meta_helper
-                    t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
-                    with conn:
-                        conn.execute(
-                            "UPDATE books SET title = COALESCE(NULLIF(?, ''), title), author = COALESCE(NULLIF(?, ''), author), publisher = COALESCE(NULLIF(?, ''), publisher) WHERE id = ?",
-                            (t_val, a_val, p_val, bid),
-                        )
+                    if has_drive_oauth():
+                        drive_rest_download(bid, tmp_epub)
+                        downloaded_ok = tmp_epub.exists()
+                    elif os.path.exists(GDRIVE_BIN):
+                        dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
+                        downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
+                    if downloaded_ok:
+                        t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
+                        conn_w = get_db()
+                        try:
+                            with conn_w:
+                                conn_w.execute(
+                                    "UPDATE books SET title = COALESCE(NULLIF(?, ''), title), author = COALESCE(NULLIF(?, ''), author), publisher = COALESCE(NULLIF(?, ''), publisher) WHERE id = ?",
+                                    (t_val, a_val, p_val, bid),
+                                )
+                        finally:
+                            conn_w.close()
                 except Exception:
                     pass
                 finally:
@@ -862,9 +912,11 @@ def sync_library_from_drive() -> list:
                         tmp_epub.unlink()
                     except Exception:
                         pass
-        return get_all_books()
-    finally:
-        conn.close()
+        finally:
+            with _META_ENRICH_LOCK:
+                _META_ENRICH_RUNNING = False
+
+    threading.Thread(target=_worker, daemon=True, name="folio-meta-enrich").start()
 
 
 def deduplicate_books(books: list) -> list:
