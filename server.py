@@ -153,6 +153,9 @@ def init_db():
                         )
             except Exception:
                 pass
+        conn.execute(
+            "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%'"
+        )
     conn.close()
 
 
@@ -671,7 +674,16 @@ def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: set = None) ->
         if ignored_name in folder_path:
             return True
     name = (item_or_book.get("name") or "").lower().strip()
-    if name == "book.epub" or "elevenreader" in name or "(tts)" in name or "-tts.epub" in name or "_tts.epub" in name:
+    title = (item_or_book.get("title") or "").lower().strip()
+    if (
+        name == "book.epub"
+        or "getting started with adobe digital editions" in name
+        or "getting started with adobe digital editions" in title
+        or "elevenreader" in name
+        or "(tts)" in name
+        or "-tts.epub" in name
+        or "_tts.epub" in name
+    ):
         return True
     return False
 
