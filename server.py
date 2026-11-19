@@ -921,6 +921,8 @@ def start_background_metadata_enrichment(limit: int = 1000):
                     finally:
                         conn_w.close()
                     stats["ok"] += 1
+                    if stats["ok"] <= 5:
+                        print(f"OPF updated: {t_val} — {a_val} ({p_val})", flush=True)
         except Exception as exc:
             with _db_write_lock:
                 stats["err"] += 1
@@ -943,7 +945,7 @@ def start_background_metadata_enrichment(limit: int = 1000):
             conn = get_db()
             try:
                 rows = conn.execute(
-                    "SELECT id FROM books WHERE COALESCE(meta_verified, 0) = 0 ORDER BY downloaded DESC, modified_time DESC LIMIT ?",
+                    "SELECT id FROM books WHERE COALESCE(meta_verified, 0) = 0 OR publisher IS NULL OR publisher = '' ORDER BY downloaded DESC, modified_time DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 book_ids = [r["id"] for r in rows]
