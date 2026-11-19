@@ -156,7 +156,7 @@ def init_db():
             except Exception:
                 pass
         conn.execute(
-            "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%' OR id = '1Xx-8moh8UVB9Y_BVTNBkR2uLIbhIjvG0' OR LOWER(name) LIKE '%process-tracing methods%'"
+            "DELETE FROM books WHERE LOWER(name) LIKE '%getting started with adobe digital editions%' OR LOWER(title) LIKE '%getting started with adobe digital editions%' OR id = '1Xx-8moh8UVB9Y_BVTNBkR2uLIbhIjvG0' OR LOWER(name) LIKE '%process-tracing methods%' OR parent_folder_id = '1nl6-80t4lZ7Yg8LDjaujJOiHOQ1NlbhX' OR LOWER(folder_path) LIKE '%_duplicates_to_trash%'"
         )
         meta_file = BASE_DIR / "metadata_seed.json"
         if meta_file.exists():
@@ -681,8 +681,9 @@ IGNORED_FOLDER_IDS = {
     "1jN3X4CNW5vpvNyu47TR32kUJFPmTZRba",  # ElevenReader epubs
     "1pY3dK-t0C9_5v9hcIuzeyCNLN3Oog6oM",  # tts-epub converter2/output_epubs
     "18ilVVqJHmQa5y-96tCN40uY5uCP7Oj2W",  # tts-epub converter2
+    "1nl6-80t4lZ7Yg8LDjaujJOiHOQ1NlbhX",  # _Duplicates_To_Trash
 }
-IGNORED_FOLDER_NAMES = {"elevenreader epubs", "elevenreader", "epub_out", "output_epubs", "tts-epub"}
+IGNORED_FOLDER_NAMES = {"elevenreader epubs", "elevenreader", "epub_out", "output_epubs", "tts-epub", "_duplicates_to_trash"}
 
 
 def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: set = None) -> bool:
@@ -739,7 +740,7 @@ def sync_library_from_drive() -> list:
             q_folders = (
                 "trashed = false and mimeType = 'application/vnd.google-apps.folder' and "
                 "(name = 'ElevenReader epubs' or name = 'epub_out' or name = 'output_epubs' "
-                "or name = 'tts-epub converter' or name = 'tts-epub converter2')"
+                "or name = 'tts-epub converter' or name = 'tts-epub converter2' or name = '_Duplicates_To_Trash')"
             )
             f_data = drive_rest_json(
                 "https://www.googleapis.com/drive/v3/files?"
