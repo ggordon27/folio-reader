@@ -137,6 +137,8 @@ def init_db():
             conn.execute("ALTER TABLE books ADD COLUMN folder_path TEXT DEFAULT ''")
         if "tags" not in cols:
             conn.execute("ALTER TABLE books ADD COLUMN tags TEXT DEFAULT '[]'")
+        if "meta_verified" not in cols:
+            conn.execute("ALTER TABLE books ADD COLUMN meta_verified INTEGER DEFAULT 0")
         ann_cols = [r["name"] for r in conn.execute("PRAGMA table_info(annotations)").fetchall()]
         if "page_number" not in ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN page_number TEXT DEFAULT ''")
@@ -170,7 +172,7 @@ def init_db():
                             author = COALESCE(NULLIF(?, ''), author),
                             publisher = COALESCE(NULLIF(?, ''), publisher),
                             folder_path = COALESCE(NULLIF(?, ''), folder_path)
-                        WHERE id = ? AND (author IS NULL OR author = '' OR folder_path IS NULL OR folder_path = '')
+                        WHERE id = ?
                         """,
                         (m.get("title", ""), m.get("author", ""), m.get("publisher", ""), m.get("folder_path", ""), bid),
                     )
@@ -862,13 +864,50 @@ _META_ENRICH_LOCK = threading.Lock()
 _META_ENRICH_RUNNING = False
 
 
-def start_background_metadata_enrichment(limit: int = 60):
-    """Extracts OPF title/author/publisher in /tmp for uncached books without blocking requests."""
+def start_background_metadata_enrichment(limit: int = 1000):
+    """Extracts true OPF title/author/publisher in /tmp for unverified books without caching them."""
     global _META_ENRICH_RUNNING
     with _META_ENRICH_LOCK:
         if _META_ENRICH_RUNNING:
             return
         _META_ENRICH_RUNNING = True
+
+    def _enrich_one(bid: str):
+        tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
+        try:
+            downloaded_ok = False
+            if has_drive_oauth():
+                drive_rest_download(bid, tmp_epub)
+                downloaded_ok = tmp_epub.exists()
+            elif os.path.exists(GDRIVE_BIN):
+                dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
+                downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
+            if downloaded_ok:
+                import extract_meta_helper
+                t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
+                conn_w = get_db()
+                try:
+                    with conn_w:
+                        conn_w.execute(
+                            """
+                            UPDATE books
+                            SET title = COALESCE(NULLIF(?, ''), title),
+                                author = COALESCE(NULLIF(?, ''), author),
+                                publisher = COALESCE(NULLIF(?, ''), publisher),
+                                meta_verified = 1
+                            WHERE id = ?
+                            """,
+                            (t_val, a_val, p_val, bid),
+                        )
+                finally:
+                    conn_w.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                tmp_epub.unlink()
+            except Exception:
+                pass
 
     def _worker():
         global _META_ENRICH_RUNNING
@@ -876,42 +915,18 @@ def start_background_metadata_enrichment(limit: int = 60):
             conn = get_db()
             try:
                 rows = conn.execute(
-                    "SELECT id FROM books WHERE (author = '' OR author IS NULL) ORDER BY modified_time DESC LIMIT ?",
+                    "SELECT id FROM books WHERE COALESCE(meta_verified, 0) = 0 ORDER BY modified_time DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 book_ids = [r["id"] for r in rows]
             finally:
                 conn.close()
 
-            import extract_meta_helper
-            for bid in book_ids:
-                tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
-                try:
-                    downloaded_ok = False
-                    if has_drive_oauth():
-                        drive_rest_download(bid, tmp_epub)
-                        downloaded_ok = tmp_epub.exists()
-                    elif os.path.exists(GDRIVE_BIN):
-                        dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
-                        downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
-                    if downloaded_ok:
-                        t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
-                        conn_w = get_db()
-                        try:
-                            with conn_w:
-                                conn_w.execute(
-                                    "UPDATE books SET title = COALESCE(NULLIF(?, ''), title), author = COALESCE(NULLIF(?, ''), author), publisher = COALESCE(NULLIF(?, ''), publisher) WHERE id = ?",
-                                    (t_val, a_val, p_val, bid),
-                                )
-                        finally:
-                            conn_w.close()
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        tmp_epub.unlink()
-                    except Exception:
-                        pass
+            if not book_ids:
+                return
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_enrich_one, book_ids))
         finally:
             with _META_ENRICH_LOCK:
                 _META_ENRICH_RUNNING = False
@@ -2691,6 +2706,8 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
 def main():
     init_db()
     start_periodic_drive_sync()
+    if has_drive_oauth():
+        start_background_metadata_enrichment(limit=1000)
     port = int(os.environ.get("PORT", 8765))
     host = os.environ.get("HOST", "0.0.0.0" if (os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT")) else "127.0.0.1")
     server = ThreadingHTTPServer((host, port), ReaderRequestHandler)
