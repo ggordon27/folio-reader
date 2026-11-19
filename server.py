@@ -939,13 +939,18 @@ def start_background_metadata_enrichment(limit: int = 1000):
 
 def deduplicate_books(books: list) -> list:
     """Keeps one canonical entry per book, preferring annotated/cached/foldered copies."""
-    def _norm_title(s: str) -> str:
+    def _split_title(s: str) -> tuple[str, str, str]:
         s = re.sub(r"\.epub$", "", (s or "").lower())
         s = re.sub(r"_for_geoffrey[-_]gordon", "", s)
-        return re.sub(r"[^a-z0-9]+", " ", s).strip()
+        parts = re.split(r"[:;—]", s, 1)
+        main = re.sub(r"[^a-z0-9]+", " ", parts[0]).strip()
+        sub = re.sub(r"[^a-z0-9]+", " ", parts[1]).strip() if len(parts) > 1 else ""
+        full = (main + " " + sub).strip()
+        return full, main, sub
 
-    def _norm_author(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    def _author_tokens(s: str) -> set[str]:
+        toks = set(re.findall(r"[a-z]{3,}", (s or "").lower()))
+        return toks - {"various", "unknown", "editor", "edited", "and"}
 
     def _score(b: dict) -> tuple:
         return (
@@ -953,6 +958,7 @@ def deduplicate_books(books: list) -> list:
             1 if b.get("downloaded") else 0,
             1 if b.get("last_opened_at") else 0,
             1 if (b.get("folder_path") or "").strip() else 0,
+            1 if (b.get("meta_verified") or 0) else 0,
             1 if (b.get("author") or "").strip() else 0,
             b.get("size") or 0,
             b.get("modified_time") or "",
@@ -960,30 +966,36 @@ def deduplicate_books(books: list) -> list:
 
     groups: dict[str, list] = {}
     for b in books:
-        k = _norm_title(b.get("title") or b.get("name") or "") or b["id"]
-        groups.setdefault(k, []).append(b)
+        full, main, sub = _split_title(b.get("title") or b.get("name") or "")
+        key = main if (len(main) >= 10 and len(main.split()) >= 2) else (full or b["id"])
+        groups.setdefault(key, []).append((b, full, main, sub))
 
     keep_ids = set()
     for items in groups.values():
         if len(items) == 1:
-            keep_ids.add(items[0]["id"])
+            keep_ids.add(items[0][0]["id"])
             continue
-        reps: list[dict] = []
-        for it in sorted(items, key=_score, reverse=True):
+        reps: list[tuple] = []
+        for it, full, main, sub in sorted(items, key=lambda x: _score(x[0]), reverse=True):
             if (it.get("annotation_count") or 0) > 0:
                 keep_ids.add(it["id"])
-                reps.append(it)
+                reps.append((it, full, main, sub))
                 continue
-            a = _norm_author(it.get("author") or "")
             matched = False
-            for rep in reps:
-                ra = _norm_author(rep.get("author") or "")
-                if not a or not ra or a == ra or a in ra or ra in a:
+            at = _author_tokens(it.get("author") or "")
+            for rit, rfull, rmain, rsub in reps:
+                if full == rfull:
+                    matched = True
+                    break
+                if not sub or not rsub or sub.startswith(rsub[:12]) or rsub.startswith(sub[:12]):
+                    matched = True
+                    break
+                if at & _author_tokens(rit.get("author") or ""):
                     matched = True
                     break
             if not matched:
                 keep_ids.add(it["id"])
-                reps.append(it)
+                reps.append((it, full, main, sub))
 
     return [b for b in books if b["id"] in keep_ids]
 
