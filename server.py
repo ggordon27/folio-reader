@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -1339,6 +1340,72 @@ def sync_annotations_to_drive(book_id: str) -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+_AUTO_SYNC_TIMERS: dict[str, threading.Timer] = {}
+_AUTO_SYNC_LOCK = threading.Lock()
+
+
+def schedule_book_auto_sync(book_id: str, delay_seconds: float = 15.0):
+    """Debounces background Drive sync shortly after any annotation create/update/delete."""
+    def _run():
+        with _AUTO_SYNC_LOCK:
+            _AUTO_SYNC_TIMERS.pop(book_id, None)
+        try:
+            sync_annotations_to_drive(book_id)
+        except Exception:
+            pass
+
+    with _AUTO_SYNC_LOCK:
+        prev = _AUTO_SYNC_TIMERS.get(book_id)
+        if prev:
+            prev.cancel()
+        t = threading.Timer(delay_seconds, _run)
+        t.daemon = True
+        _AUTO_SYNC_TIMERS[book_id] = t
+        t.start()
+
+
+def sync_dirty_books_to_drive() -> int:
+    """Syncs any book whose annotations were updated since its last_synced_at."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT b.id FROM books b
+            WHERE EXISTS (
+                SELECT 1 FROM annotations a
+                WHERE a.book_id = b.id
+                  AND (b.last_synced_at IS NULL OR b.last_synced_at = '' OR a.updated_at > b.last_synced_at)
+            )
+            """
+        ).fetchall()
+        book_ids = [r["id"] for r in rows]
+    finally:
+        conn.close()
+
+    synced = 0
+    for bid in book_ids:
+        try:
+            sync_annotations_to_drive(bid)
+            synced += 1
+        except Exception:
+            pass
+    return synced
+
+
+def start_periodic_drive_sync(interval_seconds: int = 900):
+    """Runs a background sweep every 15 minutes to sync any unsynced highlights to Drive."""
+    def _loop():
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                sync_dirty_books_to_drive()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_loop, daemon=True, name="folio-periodic-drive-sync")
+    t.start()
+
+
 def get_book_chapter_text(book_id: str, chapter_index: int) -> tuple[str, str]:
     book = ensure_book_downloaded_and_parsed(book_id)
     chapters = (book.get("manifest") or {}).get("chapters") or []
@@ -2177,6 +2244,7 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
                     row = conn.execute("SELECT * FROM annotations WHERE id = ?", (ann_id,)).fetchone()
                 finally:
                     conn.close()
+                schedule_book_auto_sync(book_id)
                 self.send_json({"annotation": dict(row)})
                 return
 
@@ -2457,6 +2525,7 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
                         conn.execute("DELETE FROM annotations WHERE id = ? AND book_id = ?", (ann_id, book_id))
                 finally:
                     conn.close()
+                schedule_book_auto_sync(book_id)
                 self.send_json({"ok": True})
                 return
 
@@ -2493,6 +2562,7 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    start_periodic_drive_sync()
     port = int(os.environ.get("PORT", 8765))
     host = os.environ.get("HOST", "0.0.0.0" if (os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT")) else "127.0.0.1")
     server = ThreadingHTTPServer((host, port), ReaderRequestHandler)
