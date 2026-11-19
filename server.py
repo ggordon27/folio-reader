@@ -140,6 +140,19 @@ def init_db():
         ann_cols = [r["name"] for r in conn.execute("PRAGMA table_info(annotations)").fetchall()]
         if "page_number" not in ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN page_number TEXT DEFAULT ''")
+
+        seed_file = BASE_DIR / "tag_seed.json"
+        if seed_file.exists():
+            try:
+                seed_map = json.loads(seed_file.read_text(encoding="utf-8"))
+                for bid, tags in seed_map.items():
+                    if bid and tags:
+                        conn.execute(
+                            "UPDATE books SET tags = ? WHERE id = ? AND (tags IS NULL OR tags = '' OR tags = '[]')",
+                            (json.dumps(tags), bid),
+                        )
+            except Exception:
+                pass
     conn.close()
 
 

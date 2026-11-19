@@ -433,6 +433,23 @@ function populateFolderDropdown() {
       .join("");
 }
 
+const PRESET_TAGS = [
+  "Reading",
+  "To Read",
+  "Reference",
+  "Finished",
+  "Dissertation",
+  "Syllabus",
+  "Value & Capital",
+  "Energy & Ecology",
+  "Race & Empire",
+  "Social Reproduction",
+  "Critical Theory",
+  "Tech & Logistics",
+  "Strategy & History",
+  "Fiction",
+];
+
 function populateTagDropdown() {
   if (!el.libraryTagSelect) return;
   const tagCounts = {};
@@ -441,8 +458,7 @@ function populateTagDropdown() {
       tagCounts[t] = (tagCounts[t] || 0) + 1;
     }
   }
-  const presets = ["To Read", "Reading", "Finished", "Dissertation"];
-  const allTags = Array.from(new Set([...presets, ...Object.keys(tagCounts)])).sort((a, b) =>
+  const allTags = Array.from(new Set([...PRESET_TAGS, ...Object.keys(tagCounts)])).sort((a, b) =>
     a.localeCompare(b)
   );
   const current = state.tagFilter;
@@ -595,8 +611,7 @@ function openTagPicker(bookId, anchorBtn) {
   state.tagPickerBookId = bookId;
   const book = state.books.find((b) => b.id === bookId);
   const bookTags = new Set(book?.tags || []);
-  const presets = ["To Read", "Reading", "Finished", "Dissertation"];
-  const allTags = new Set(presets);
+  const allTags = new Set(PRESET_TAGS);
   for (const b of state.books) {
     for (const t of b.tags || []) allTags.add(t);
   }
