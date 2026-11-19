@@ -278,8 +278,12 @@ def get_drive_access_token() -> str:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Google OAuth token refresh failed ({e.code}): {err_body}")
     tok = data["access_token"]
     _DRIVE_TOKEN_CACHE["access_token"] = tok
     _DRIVE_TOKEN_CACHE["expires_at"] = time.time() + float(data.get("expires_in", 3500))
@@ -292,9 +296,13 @@ def drive_rest_json(url: str, method: str = "GET", body_bytes: bytes = None, con
     if body_bytes is not None:
         headers["Content-Type"] = content_type
     req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Google Drive API error ({e.code}): {err_body}")
 
 
 def drive_rest_download(file_id: str, out_path: Path):
@@ -686,12 +694,11 @@ def sync_library_from_drive() -> list:
     cursor_before = None
     gdrive_ok = False
     if has_drive_oauth():
-        try:
-            for item in drive_rest_search_epubs():
-                all_fetched[item["id"]] = item
-            gdrive_ok = True
-        except Exception:
-            gdrive_ok = False
+        for item in drive_rest_search_epubs():
+            all_fetched[item["id"]] = item
+        gdrive_ok = True
+    elif not os.path.exists(GDRIVE_BIN):
+        raise RuntimeError("Google Drive OAuth is not connected. Open Settings -> Connect Google Drive via OAuth.")
 
     while not gdrive_ok:
         cmd = ["readonly", "search", "--name-contains", ".epub", "--max", "100", "--json"]
