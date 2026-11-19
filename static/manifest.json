@@ -1,0 +1,17 @@
+{
+  "name": "Folio — Drive EPUB & Gemini Reader",
+  "short_name": "Folio",
+  "description": "Read, highlight, annotate, and discuss your Google Drive EPUB library with Gemini.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f1e7",
+  "theme_color": "#8c4a27",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
