@@ -56,7 +56,7 @@ mimetypes.add_type("font/otf", ".otf")
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -64,6 +64,7 @@ def get_db():
 def init_db():
     conn = get_db()
     with conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -881,6 +882,9 @@ def start_background_metadata_enrichment(limit: int = 1000):
             return
         _META_ENRICH_RUNNING = True
 
+    _db_write_lock = threading.Lock()
+    stats = {"done": 0, "ok": 0, "err": 0, "total": 0}
+
     def _enrich_one(bid: str):
         local_epub = BOOKS_DIR / bid / "book.epub"
         tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
@@ -899,25 +903,34 @@ def start_background_metadata_enrichment(limit: int = 1000):
             if target_epub:
                 import extract_meta_helper
                 t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(target_epub))
-                conn_w = get_db()
-                try:
-                    with conn_w:
-                        conn_w.execute(
-                            """
-                            UPDATE books
-                            SET title = COALESCE(NULLIF(?, ''), title),
-                                author = COALESCE(NULLIF(?, ''), author),
-                                publisher = COALESCE(NULLIF(?, ''), publisher),
-                                meta_verified = 1
-                            WHERE id = ?
-                            """,
-                            (t_val, a_val, p_val, bid),
-                        )
-                finally:
-                    conn_w.close()
-        except Exception:
-            pass
+                with _db_write_lock:
+                    conn_w = get_db()
+                    try:
+                        with conn_w:
+                            conn_w.execute(
+                                """
+                                UPDATE books
+                                SET title = COALESCE(NULLIF(?, ''), title),
+                                    author = COALESCE(NULLIF(?, ''), author),
+                                    publisher = COALESCE(NULLIF(?, ''), publisher),
+                                    meta_verified = 1
+                                WHERE id = ?
+                                """,
+                                (t_val, a_val, p_val, bid),
+                            )
+                    finally:
+                        conn_w.close()
+                    stats["ok"] += 1
+        except Exception as exc:
+            with _db_write_lock:
+                stats["err"] += 1
+                if stats["err"] <= 5:
+                    print(f"OPF enrich error ({bid}): {exc}", flush=True)
         finally:
+            with _db_write_lock:
+                stats["done"] += 1
+                if stats["done"] % 50 == 0 or stats["done"] == stats["total"]:
+                    print(f"OPF enrichment: {stats['done']}/{stats['total']} (updated {stats['ok']}, errors {stats['err']})", flush=True)
             try:
                 if tmp_epub.exists():
                     tmp_epub.unlink()
@@ -930,7 +943,7 @@ def start_background_metadata_enrichment(limit: int = 1000):
             conn = get_db()
             try:
                 rows = conn.execute(
-                    "SELECT id FROM books WHERE COALESCE(meta_verified, 0) = 0 ORDER BY modified_time DESC LIMIT ?",
+                    "SELECT id FROM books WHERE COALESCE(meta_verified, 0) = 0 ORDER BY downloaded DESC, modified_time DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
                 book_ids = [r["id"] for r in rows]
@@ -938,7 +951,10 @@ def start_background_metadata_enrichment(limit: int = 1000):
                 conn.close()
 
             if not book_ids:
+                print("OPF enrichment: all books already verified.", flush=True)
                 return
+            stats["total"] = len(book_ids)
+            print(f"OPF enrichment starting for {len(book_ids)} unverified books...", flush=True)
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(_enrich_one, book_ids))
