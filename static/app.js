@@ -530,6 +530,31 @@ async function runGlobalSearch() {
   }
 }
 
+function getBookProgressInfo(book) {
+  const chapters = (book.manifest && book.manifest.chapters) || [];
+  const rawIdx = book.last_chapter_index || 0;
+  if (chapters.length === 0) {
+    return {
+      label: `Sec. ${rawIdx + 1}`,
+      pct: Math.round((book.scroll_percent || 0) * 100),
+    };
+  }
+  const idx = Math.max(0, Math.min(chapters.length - 1, rawIdx));
+  const sectionTitle = chapters[idx]?.title || `Sec. ${idx + 1}`;
+  const totalWords = chapters.reduce((acc, c) => acc + (c.word_count || 0), 0);
+  const scrollPct = Math.min(1, Math.max(0, book.scroll_percent || 0));
+  let pct = 0;
+  if (totalWords > 0) {
+    let wordsBefore = 0;
+    for (let i = 0; i < idx; i++) wordsBefore += chapters[i].word_count || 0;
+    const curWords = chapters[idx]?.word_count || 0;
+    pct = Math.min(100, Math.round(((wordsBefore + curWords * scrollPct) / totalWords) * 100));
+  } else {
+    pct = Math.min(100, Math.round(((idx + scrollPct) / chapters.length) * 100));
+  }
+  return { label: sectionTitle, pct };
+}
+
 function renderContinueReading() {
   if (!el.continueReadingSection || !el.continueReadingRow) return;
   const hasFilter = Boolean(state.filterQuery.trim() || state.folderFilter || state.tagFilter);
@@ -541,9 +566,7 @@ function renderContinueReading() {
   el.continueReadingSection.classList.remove("hidden");
   el.continueReadingRow.innerHTML = recent
     .map((b) => {
-      const chCount = (b.manifest && b.manifest.chapters && b.manifest.chapters.length) || 0;
-      const chIdx = (b.last_chapter_index || 0) + 1;
-      const pct = chCount > 0 ? Math.min(100, Math.round((chIdx / chCount) * 100)) : Math.round((b.scroll_percent || 0) * 100);
+      const prog = getBookProgressInfo(b);
       return `
         <div class="continue-card" data-book-id="${escapeHtml(b.id)}">
           <div>
@@ -551,8 +574,8 @@ function renderContinueReading() {
             <div class="continue-card-sub">${escapeHtml(b.author || "EPUB")}</div>
           </div>
           <div>
-            <div class="continue-card-sub" style="margin-bottom:4px;">Ch. ${chIdx}${chCount ? ` of ${chCount}` : ""} · ${pct}%</div>
-            <div class="continue-progress-track"><div class="continue-progress-fill" style="width:${pct}%"></div></div>
+            <div class="continue-card-sub" title="${escapeHtml(prog.label)}" style="margin-bottom:4px;">${escapeHtml(prog.label)} · ${prog.pct}%</div>
+            <div class="continue-progress-track"><div class="continue-progress-fill" style="width:${prog.pct}%"></div></div>
           </div>
         </div>`;
     })
@@ -671,6 +694,8 @@ function renderLibraryGrid() {
           )
           .join("");
 
+        const prog = book.last_opened_at ? getBookProgressInfo(book) : null;
+
         if (state.libraryViewMode === "list") {
           return `
           <article class="library-list-row" data-book-id="${escapeHtml(book.id)}">
@@ -681,7 +706,7 @@ function renderLibraryGrid() {
               <button type="button" class="btn-add-tag" data-book-id="${escapeHtml(book.id)}">+ Tag</button>
             </div>
             <div class="list-row-author">${annCount > 0 ? `🖍️ ${annCount}` : ""}</div>
-            <div class="list-row-author">${book.last_opened_at ? `Ch. ${(book.last_chapter_index || 0) + 1}` : (book.downloaded ? "Cached" : "Drive")}</div>
+            <div class="list-row-author" title="${prog ? escapeHtml(prog.label) : ""}">${prog ? `${escapeHtml(prog.label)} (${prog.pct}%)` : (book.downloaded ? "Cached" : "Drive")}</div>
           </article>`;
         }
 
@@ -714,7 +739,7 @@ function renderLibraryGrid() {
             </div>
             <div class="book-card-meta">
               <span title="${escapeHtml(folderTag)}">${escapeHtml(folderTag ? folderTag.split(" / ").pop() : formatBytes(book.size))}</span>
-              <span>${book.last_opened_at ? `Ch. ${(book.last_chapter_index || 0) + 1}` : "Open Book →"}</span>
+              <span title="${prog ? escapeHtml(prog.label) : ""}" style="max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${prog ? `${escapeHtml(prog.label)} · ${prog.pct}%` : "Open Book →"}</span>
             </div>
           </div>
         </article>
