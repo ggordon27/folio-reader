@@ -232,6 +232,8 @@ const el = {
   driveOAuthDot: document.getElementById("driveOAuthDot"),
   driveOAuthStatusText: document.getElementById("driveOAuthStatusText"),
   inputFolioPasscode: document.getElementById("inputFolioPasscode"),
+  cacheStatsText: document.getElementById("cacheStatsText"),
+  btnPruneCache: document.getElementById("btnPruneCache"),
   btnSaveSettings: document.getElementById("btnSaveSettings"),
 
   authModal: document.getElementById("authModal"),
@@ -729,7 +731,7 @@ function renderLibraryGrid() {
         <article class="book-card" data-book-id="${escapeHtml(book.id)}">
           <div class="book-cover-area">
             <div class="book-badge-row">
-              ${book.downloaded ? `<span class="badge badge-downloaded">Cached Locally</span>` : `<span class="badge">On Drive</span>`}
+              ${book.downloaded ? `<span class="badge badge-downloaded">Cached</span>` : `<span class="badge">On Drive</span>`}
               ${annCount > 0 ? `<span class="badge">🖍️ ${annCount}</span>` : ""}
             </div>
             ${
@@ -2577,8 +2579,39 @@ function initEventListeners() {
   });
 
   // Settings, Shortcuts & Compare Modals
+  const refreshCacheStats = async () => {
+    if (!el.cacheStatsText) return;
+    try {
+      const res = await fetch("/api/cache/stats?days=10");
+      const st = await res.json();
+      if (st.error) throw new Error(st.error);
+      el.cacheStatsText.textContent = `${st.total_cached} cached (${formatBytes(st.cache_bytes)}) · ${st.stale_count} unopened for 10+ days`;
+    } catch (e) {
+      el.cacheStatsText.textContent = "Unable to check cache stats.";
+    }
+  };
   el.btnOpenSettings.addEventListener("click", () => {
     el.settingsModal.classList.remove("hidden");
+    refreshCacheStats();
+  });
+  el.btnPruneCache?.addEventListener("click", async () => {
+    el.btnPruneCache.disabled = true;
+    try {
+      const res = await fetch("/api/cache/prune", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ days: 10 }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      showToast(`Cleared ${data.cleared_count} cached EPUB(s) (${formatBytes(data.freed_bytes)} freed). Highlights & notes preserved.`);
+      await refreshCacheStats();
+      await fetchBooks(false);
+    } catch (e) {
+      showToast(`Cache clear failed: ${e.message}`);
+    } finally {
+      el.btnPruneCache.disabled = false;
+    }
   });
   el.btnCloseSettings.addEventListener("click", () => {
     el.settingsModal.classList.add("hidden");

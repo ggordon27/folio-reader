@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1023,6 +1023,62 @@ def get_all_books() -> list:
         conn.close()
 
 
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def get_epub_cache_stats(days: int = 10) -> dict:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = get_db()
+    try:
+        total_cached = conn.execute("SELECT COUNT(*) FROM books WHERE downloaded = 1").fetchone()[0]
+        stale_count = conn.execute(
+            "SELECT COUNT(*) FROM books WHERE downloaded = 1 AND (last_opened_at IS NULL OR last_opened_at < ?)",
+            (cutoff,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return {
+        "total_cached": total_cached,
+        "stale_count": stale_count,
+        "cache_bytes": _dir_size_bytes(BOOKS_DIR),
+        "days": days,
+    }
+
+
+def prune_stale_epub_cache(days: int = 10) -> dict:
+    """Removes cached EPUB files unopened for >= `days` days, preserving all highlights, notes, tags & progress."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM books WHERE downloaded = 1 AND (last_opened_at IS NULL OR last_opened_at < ?)",
+            (cutoff,),
+        ).fetchall()
+        stale_ids = [r["id"] for r in rows]
+        freed_bytes = 0
+        for bid in stale_ids:
+            bdir = BOOKS_DIR / bid
+            freed_bytes += _dir_size_bytes(bdir)
+            shutil.rmtree(bdir, ignore_errors=True)
+        if stale_ids:
+            with conn:
+                placeholders = ",".join("?" for _ in stale_ids)
+                conn.execute(f"UPDATE books SET downloaded = 0 WHERE id IN ({placeholders})", tuple(stale_ids))
+    finally:
+        conn.close()
+    return {"cleared_count": len(stale_ids), "freed_bytes": freed_bytes, "days": days}
+
+
 def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
     conn = get_db()
     try:
@@ -1945,6 +2001,11 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if path == "/api/cache/stats":
+                days = int((query.get("days") or ["10"])[0])
+                self.send_json(get_epub_cache_stats(days=days))
+                return
+
             if path == "/api/books":
                 books = get_all_books()
                 if not books:
@@ -2183,6 +2244,12 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/books/sync":
                 books = sync_library_from_drive()
                 self.send_json({"books": books})
+                return
+
+            if path == "/api/cache/prune":
+                days = int(body.get("days", 10))
+                res = prune_stale_epub_cache(days=days)
+                self.send_json(res)
                 return
 
             m_prog = re.match(r"^/api/books/([^/]+)/progress$", path)

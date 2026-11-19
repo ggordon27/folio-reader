@@ -572,6 +572,14 @@
           <label for="inputFolioPasscode">App Passcode (optional lock for cloud access)</label>
           <input type="password" id="inputFolioPasscode" placeholder="Leave blank for no passcode (or set FOLIO_PASSCODE env var)" autocomplete="off" />
         </div>
+        <div class="form-group">
+          <label>EPUB Storage Cache</label>
+          <div id="cacheStatsText" class="form-help" style="margin-bottom:8px;">Checking cached EPUBs...</div>
+          <button type="button" id="btnPruneCache" class="btn btn-secondary btn-sm">
+            🧹 Clear EPUBs Unopened 10+ Days
+          </button>
+          <p class="form-help">Removes unpacked EPUB files to free disk space. Your highlights, notes, tags, and reading progress are always preserved.</p>
+        </div>
       </div>
       <div class="modal-footer">
         <button id="btnSaveSettings" class="btn btn-primary">Save Settings</button>
