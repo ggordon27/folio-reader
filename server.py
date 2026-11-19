@@ -165,16 +165,21 @@ def init_db():
                 for bid, m in meta_map.items():
                     if not bid or not isinstance(m, dict):
                         continue
+                    fp = m.get("folder_path", "")
+                    if fp:
+                        conn.execute(
+                            "UPDATE books SET folder_path = ? WHERE id = ? AND (folder_path IS NULL OR folder_path = '')",
+                            (fp, bid),
+                        )
                     conn.execute(
                         """
                         UPDATE books
                         SET title = COALESCE(NULLIF(?, ''), title),
                             author = COALESCE(NULLIF(?, ''), author),
-                            publisher = COALESCE(NULLIF(?, ''), publisher),
-                            folder_path = COALESCE(NULLIF(?, ''), folder_path)
-                        WHERE id = ?
+                            publisher = COALESCE(NULLIF(?, ''), publisher)
+                        WHERE id = ? AND COALESCE(meta_verified, 0) = 0 AND (author IS NULL OR author = '')
                         """,
-                        (m.get("title", ""), m.get("author", ""), m.get("publisher", ""), m.get("folder_path", ""), bid),
+                        (m.get("title", ""), m.get("author", ""), m.get("publisher", ""), bid),
                     )
             except Exception:
                 pass
@@ -877,18 +882,23 @@ def start_background_metadata_enrichment(limit: int = 1000):
         _META_ENRICH_RUNNING = True
 
     def _enrich_one(bid: str):
+        local_epub = BOOKS_DIR / bid / "book.epub"
         tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
         try:
-            downloaded_ok = False
-            if has_drive_oauth():
+            target_epub = None
+            if local_epub.exists():
+                target_epub = local_epub
+            elif has_drive_oauth():
                 drive_rest_download(bid, tmp_epub)
-                downloaded_ok = tmp_epub.exists()
+                if tmp_epub.exists():
+                    target_epub = tmp_epub
             elif os.path.exists(GDRIVE_BIN):
                 dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
-                downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
-            if downloaded_ok:
+                if dl_p.returncode == 0 and tmp_epub.exists():
+                    target_epub = tmp_epub
+            if target_epub:
                 import extract_meta_helper
-                t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
+                t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(target_epub))
                 conn_w = get_db()
                 try:
                     with conn_w:
@@ -909,7 +919,8 @@ def start_background_metadata_enrichment(limit: int = 1000):
             pass
         finally:
             try:
-                tmp_epub.unlink()
+                if tmp_epub.exists():
+                    tmp_epub.unlink()
             except Exception:
                 pass
 
@@ -1143,7 +1154,7 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
                     UPDATE books
                     SET title = ?, author = ?, publisher = ?, cover_href = ?, opf_dir = ?,
                         parent_folder_id = COALESCE(NULLIF(?, ''), parent_folder_id),
-                        downloaded = 1, last_opened_at = ?, manifest_json = ?
+                        downloaded = 1, meta_verified = 1, last_opened_at = ?, manifest_json = ?
                     WHERE id = ?
                     """,
                     (
