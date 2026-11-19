@@ -1705,8 +1705,18 @@ kbd {
 
 .compare-selectors {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+
+.compare-selectors .form-group {
+  min-width: 0;
+}
+
+.compare-selectors select {
+  width: 100%;
+  max-width: 100%;
+  text-overflow: ellipsis;
 }
 
 .compare-result-box {
