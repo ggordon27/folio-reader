@@ -855,6 +855,57 @@ def sync_library_from_drive() -> list:
         conn.close()
 
 
+def deduplicate_books(books: list) -> list:
+    """Keeps one canonical entry per book, preferring annotated/cached/foldered copies."""
+    def _norm_title(s: str) -> str:
+        s = re.sub(r"\.epub$", "", (s or "").lower())
+        s = re.sub(r"_for_geoffrey[-_]gordon", "", s)
+        return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+    def _norm_author(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+    def _score(b: dict) -> tuple:
+        return (
+            1 if (b.get("annotation_count") or 0) > 0 else 0,
+            1 if b.get("downloaded") else 0,
+            1 if b.get("last_opened_at") else 0,
+            1 if (b.get("folder_path") or "").strip() else 0,
+            1 if (b.get("author") or "").strip() else 0,
+            b.get("size") or 0,
+            b.get("modified_time") or "",
+        )
+
+    groups: dict[str, list] = {}
+    for b in books:
+        k = _norm_title(b.get("title") or b.get("name") or "") or b["id"]
+        groups.setdefault(k, []).append(b)
+
+    keep_ids = set()
+    for items in groups.values():
+        if len(items) == 1:
+            keep_ids.add(items[0]["id"])
+            continue
+        reps: list[dict] = []
+        for it in sorted(items, key=_score, reverse=True):
+            if (it.get("annotation_count") or 0) > 0:
+                keep_ids.add(it["id"])
+                reps.append(it)
+                continue
+            a = _norm_author(it.get("author") or "")
+            matched = False
+            for rep in reps:
+                ra = _norm_author(rep.get("author") or "")
+                if not a or not ra or a == ra or a in ra or ra in a:
+                    matched = True
+                    break
+            if not matched:
+                keep_ids.add(it["id"])
+                reps.append(it)
+
+    return [b for b in books if b["id"] in keep_ids]
+
+
 def get_all_books() -> list:
     conn = get_db()
     try:
@@ -888,7 +939,7 @@ def get_all_books() -> list:
             except Exception:
                 d["tags"] = []
             result.append(d)
-        return result
+        return deduplicate_books(result)
     finally:
         conn.close()
 
