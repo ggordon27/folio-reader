@@ -670,16 +670,17 @@ def sync_library_from_drive() -> list:
             pass
 
     # Refresh ignored folder file list via gdrive when available
-    for ig_folder_id in IGNORED_FOLDER_IDS:
-        ls_proc = run_gdrive(["readonly", "ls", ig_folder_id, "--json"], timeout=30)
-        if ls_proc.returncode == 0 and ls_proc.stdout.strip():
-            try:
-                for f_item in json.loads(ls_proc.stdout):
-                    if f_item.get("id"):
-                        ignored_file_ids.add(f_item["id"])
-                ignored_ids_path.write_text(json.dumps(sorted(ignored_file_ids)), encoding="utf-8")
-            except Exception:
-                pass
+    if not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
+        for ig_folder_id in IGNORED_FOLDER_IDS:
+            ls_proc = run_gdrive(["readonly", "ls", ig_folder_id, "--json"], timeout=30)
+            if ls_proc.returncode == 0 and ls_proc.stdout.strip():
+                try:
+                    for f_item in json.loads(ls_proc.stdout):
+                        if f_item.get("id"):
+                            ignored_file_ids.add(f_item["id"])
+                    ignored_ids_path.write_text(json.dumps(sorted(ignored_file_ids)), encoding="utf-8")
+                except Exception:
+                    pass
 
     all_fetched = {}
     cursor_before = None
@@ -781,8 +782,17 @@ def sync_library_from_drive() -> list:
         for ur in unmeta_rows:
             bid = ur["id"]
             tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
-            dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
-            if dl_p.returncode == 0 and tmp_epub.exists():
+            downloaded_ok = False
+            if has_drive_oauth():
+                try:
+                    drive_rest_download(bid, tmp_epub)
+                    downloaded_ok = tmp_epub.exists()
+                except Exception:
+                    downloaded_ok = False
+            elif os.path.exists(GDRIVE_BIN):
+                dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
+                downloaded_ok = dl_p.returncode == 0 and tmp_epub.exists()
+            if downloaded_ok:
                 try:
                     import extract_meta_helper
                     t_val, a_val, p_val = extract_meta_helper.extract_opf_metadata(str(tmp_epub))
@@ -1898,8 +1908,13 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
                     set_setting("google_client_id", body["google_client_id"].strip())
                 if "google_client_secret" in body and body["google_client_secret"].strip():
                     set_setting("google_client_secret", body["google_client_secret"].strip())
+                extra_hdrs = {}
                 if "folio_passcode" in body and not os.environ.get("FOLIO_PASSCODE", "").strip():
-                    set_setting("folio_passcode", body["folio_passcode"].strip())
+                    new_pc = body["folio_passcode"].strip()
+                    set_setting("folio_passcode", new_pc)
+                    if new_pc:
+                        tok = make_session_token(new_pc)
+                        extra_hdrs["Set-Cookie"] = f"folio_session={tok}; Path=/; Max-Age={30*86400}; HttpOnly; SameSite=Lax"
                 api_key = resolve_gemini_api_key()
                 self.send_json(
                     {
@@ -1909,7 +1924,8 @@ class ReaderRequestHandler(BaseHTTPRequestHandler):
                         "gemini_model": get_setting("gemini_model", "gemini-4-hydrogen"),
                         "drive_oauth_connected": has_drive_oauth(),
                         "passcode_enabled": bool(get_active_passcode()),
-                    }
+                    },
+                    extra_headers=extra_hdrs,
                 )
                 return
 
