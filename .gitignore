@@ -6,4 +6,5 @@ __pycache__/
 *.db
 .DS_Store
 .env
+.venv/
 client_secret*.json

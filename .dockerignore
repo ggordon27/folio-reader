@@ -1,7 +1,11 @@
 data/
 books/
 synced_notes/
+scripts/
 __pycache__/
 *.pyc
 .DS_Store
 .git/
+.env
+.venv/
+client_secret*.json

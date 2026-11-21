@@ -234,6 +234,8 @@ const el = {
   inputFolioPasscode: document.getElementById("inputFolioPasscode"),
   cacheStatsText: document.getElementById("cacheStatsText"),
   btnPruneCache: document.getElementById("btnPruneCache"),
+  hiddenBooksCount: document.getElementById("hiddenBooksCount"),
+  hiddenBooksList: document.getElementById("hiddenBooksList"),
   btnSaveSettings: document.getElementById("btnSaveSettings"),
 
   authModal: document.getElementById("authModal"),
@@ -241,19 +243,44 @@ const el = {
   authErrorMsg: document.getElementById("authErrorMsg"),
   btnUnlockFolio: document.getElementById("btnUnlockFolio"),
 
+  cmdPaletteModal: document.getElementById("cmdPaletteModal"),
+  cmdPaletteInput: document.getElementById("cmdPaletteInput"),
+  cmdPaletteResults: document.getElementById("cmdPaletteResults"),
+
   toastContainer: document.getElementById("toastContainer"),
 };
 
 // --- Utilities ---
 
-function showToast(msg, duration = 3500) {
+function showToast(msg, duration = 3500, action = null) {
   const t = document.createElement("div");
   t.className = "toast";
-  t.textContent = msg;
+  const span = document.createElement("span");
+  span.textContent = msg;
+  t.appendChild(span);
+  if (action && action.label && typeof action.onClick === "function") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-undo-btn";
+    btn.textContent = action.label;
+    btn.addEventListener("click", () => {
+      t.remove();
+      action.onClick();
+    });
+    t.appendChild(btn);
+  }
   el.toastContainer.appendChild(t);
   setTimeout(() => {
     t.remove();
   }, duration);
+}
+
+function debounce(fn, wait = 150) {
+  let timer = null;
+  return (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
 }
 
 function escapeHtml(str) {
@@ -552,10 +579,12 @@ function getBookProgressInfo(book) {
   const chapters = (book.manifest && book.manifest.chapters) || [];
   const rawIdx = book.last_chapter_index || 0;
   if (chapters.length === 0) {
-    return {
-      label: `Sec. ${rawIdx + 1}`,
-      pct: Math.round((book.scroll_percent || 0) * 100),
-    };
+    const label = book.last_chapter_title || `Sec. ${rawIdx + 1}`;
+    const pct =
+      typeof book.progress_percent === "number" && (book.chapter_count || 0) > 0
+        ? book.progress_percent
+        : Math.round((book.scroll_percent || 0) * 100);
+    return { label, pct };
   }
   const idx = Math.max(0, Math.min(chapters.length - 1, rawIdx));
   const sectionTitle = chapters[idx]?.title || `Sec. ${idx + 1}`;
@@ -701,8 +730,8 @@ function renderLibraryGrid() {
         const folderTag = book.folder_path ? `📁 ${book.folder_path}` : "";
         const authorName = (book.author || "").trim();
         const coverUrl =
-          book.downloaded && book.cover_href
-            ? `/epub/${encodeURIComponent(book.id)}/${book.cover_href}`
+          book.has_cover || (book.downloaded && book.cover_href)
+            ? `/api/books/${encodeURIComponent(book.id)}/cover`
             : "";
         const annCount = book.annotation_count || 0;
         const tagsHtml = (book.tags || [])
@@ -723,13 +752,17 @@ function renderLibraryGrid() {
               <button type="button" class="btn-add-tag" data-book-id="${escapeHtml(book.id)}">+ Tag</button>
             </div>
             <div class="list-row-author">${annCount > 0 ? `🖍️ ${annCount}` : ""}</div>
-            <div class="list-row-author" title="${prog ? escapeHtml(prog.label) : ""}">${prog ? `${escapeHtml(prog.label)} (${prog.pct}%)` : (book.downloaded ? "Cached" : "Drive")}</div>
+            <div class="list-row-author" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;" title="${prog ? escapeHtml(prog.label) : ""}">
+              <span>${prog ? `${escapeHtml(prog.label)} (${prog.pct}%)` : (book.downloaded ? "Cached" : "Drive")}</span>
+              <button type="button" class="btn-remove-book btn-remove-book-inline" data-remove-book="${escapeHtml(book.id)}" title="Remove from library (stays hidden on Drive sync)">×</button>
+            </div>
           </article>`;
         }
 
         return `
         <article class="book-card" data-book-id="${escapeHtml(book.id)}">
           <div class="book-cover-area">
+            <button type="button" class="btn-remove-book" data-remove-book="${escapeHtml(book.id)}" title="Remove from library (stays hidden on Drive sync)">×</button>
             <div class="book-badge-row">
               ${book.downloaded ? `<span class="badge badge-downloaded">Cached</span>` : `<span class="badge">On Drive</span>`}
               ${annCount > 0 ? `<span class="badge">🖍️ ${annCount}</span>` : ""}
@@ -795,12 +828,95 @@ function renderLibraryGrid() {
     });
   });
 
+  el.libraryGrid.querySelectorAll("[data-remove-book]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeBookFromLibrary(btn.dataset.removeBook);
+    });
+  });
+
   const btnMore = document.getElementById("btnShowMoreBooks");
   if (btnMore) {
     btnMore.addEventListener("click", () => {
       state.displayLimit += 200;
       renderLibraryGrid();
     });
+  }
+}
+
+async function removeBookFromLibrary(bookId) {
+  const book = state.books.find((b) => b.id === bookId);
+  if (!book) return;
+  const title = book.title || book.name || "Book";
+  if ((book.annotation_count || 0) > 0) {
+    const ok = window.confirm(
+      `Remove "${title}" from your library?\n\nIt has ${book.annotation_count} saved highlight(s). They will be preserved if you ever restore it from Settings -> Removed / Hidden Books.`
+    );
+    if (!ok) return;
+  }
+  try {
+    const res = await fetch(`/api/books/${encodeURIComponent(bookId)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    state.books = state.books.filter((b) => b.id !== bookId);
+    populateFolderDropdown();
+    populateTagDropdown();
+    renderLibraryGrid();
+    showToast(`Removed "${title}" from library`, 6000, {
+      label: "Undo",
+      onClick: () => restoreBookToLibrary(bookId),
+    });
+  } catch (e) {
+    showToast(`Failed to remove book: ${e.message}`);
+  }
+}
+
+async function restoreBookToLibrary(bookId) {
+  try {
+    const res = await fetch(`/api/books/${encodeURIComponent(bookId)}/restore`, { method: "POST" });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    if (data.book && !state.books.some((b) => b.id === data.book.id)) {
+      state.books.unshift(data.book);
+    }
+    populateFolderDropdown();
+    populateTagDropdown();
+    renderLibraryGrid();
+    refreshHiddenBooksSettings();
+    showToast(`Restored "${data.book?.title || "book"}" to library.`);
+  } catch (e) {
+    showToast(`Failed to restore book: ${e.message}`);
+  }
+}
+
+async function refreshHiddenBooksSettings() {
+  if (!el.hiddenBooksList) return;
+  try {
+    const res = await fetch("/api/books/hidden");
+    const data = await res.json();
+    const items = data.hidden_books || [];
+    if (el.hiddenBooksCount) el.hiddenBooksCount.textContent = `(${items.length})`;
+    if (items.length === 0) {
+      el.hiddenBooksList.innerHTML = `<p class="muted-hint" style="margin:0;">No removed books.</p>`;
+      return;
+    }
+    el.hiddenBooksList.innerHTML = items
+      .map(
+        (b) => `
+        <div class="hidden-book-row">
+          <div class="hidden-book-info">
+            <div class="hidden-book-title" title="${escapeHtml(b.title || b.name)}">${escapeHtml(b.title || b.name)}</div>
+            ${b.author ? `<div class="hidden-book-author">${escapeHtml(b.author)}</div>` : ""}
+          </div>
+          <button type="button" class="btn btn-xs btn-secondary" data-restore-book="${escapeHtml(b.id)}">Restore</button>
+        </div>`
+      )
+      .join("");
+    el.hiddenBooksList.querySelectorAll("[data-restore-book]").forEach((btn) => {
+      btn.addEventListener("click", () => restoreBookToLibrary(btn.dataset.restoreBook));
+    });
+  } catch (e) {
+    el.hiddenBooksList.innerHTML = `<p class="muted-hint" style="margin:0;">Unable to load hidden books.</p>`;
   }
 }
 
@@ -826,6 +942,7 @@ async function openBook(bookId, opts = {}) {
     if (book.error) throw new Error(book.error);
 
     state.activeBook = book;
+    state.endnoteDocCache = {};
     state.annotations = book.annotations || [];
     state.bookmarks = book.bookmarks || [];
     state.chats = book.chats || [];
@@ -872,15 +989,41 @@ async function openBook(bookId, opts = {}) {
 }
 
 function backToLibrary() {
+  if (state.activeBook) {
+    const idx = state.books.findIndex((b) => b.id === state.activeBook.id);
+    if (idx !== -1) {
+      const chapters = state.activeBook.manifest?.chapters || [];
+      const ch = chapters[state.currentChapterIndex];
+      const sp = getIframeScrollPercent();
+      const updated = {
+        ...state.books[idx],
+        downloaded: 1,
+        cover_href: state.activeBook.cover_href || state.books[idx].cover_href,
+        last_chapter_index: state.currentChapterIndex,
+        scroll_percent: sp,
+        last_chapter_title: ch?.title || state.books[idx].last_chapter_title || "",
+        chapter_count: chapters.length || state.books[idx].chapter_count || 0,
+        last_opened_at: new Date().toISOString(),
+        annotation_count: state.annotations.length,
+      };
+      const prog = getBookProgressInfo({ ...updated, manifest: state.activeBook.manifest });
+      updated.progress_percent = prog.pct;
+      state.books[idx] = updated;
+      // Move to front for "recent" ordering
+      state.books.splice(idx, 1);
+      state.books.unshift(updated);
+    }
+  }
   state.activeBook = null;
   state.selectedText = "";
+  state.endnoteDocCache = {};
   hideSelectionPopover();
   el.readerView.classList.add("hidden");
   el.btnBackToLibrary.classList.add("hidden");
   el.activeBookHeader.classList.add("hidden");
   el.readerToolbar.classList.add("hidden");
   el.libraryView.classList.remove("hidden");
-  fetchBooks(false);
+  renderLibraryGrid();
 }
 
 function renderToc() {
@@ -1094,14 +1237,18 @@ function detectPageNumberForRange(doc, range) {
   for (const m of markers) {
     const pg = m.getAttribute("data-folio-page");
     try {
-      const cmpStart = range.comparePoint(m, 0);
-      // cmpStart === -1 means marker is before selection start
-      if (cmpStart <= 0) {
+      const cmp = range.comparePoint(m, 0);
+      // cmp === -1: marker is before selection start
+      // cmp ===  0: marker is inside the selection range
+      // cmp ===  1: marker is after selection end
+      if (cmp === -1) {
         startPage = pg;
-      }
-      const cmpEnd = range.comparePoint(m, 0);
-      if (cmpEnd <= 0) {
         endPage = pg;
+      } else if (cmp === 0) {
+        if (!startPage) startPage = pg;
+        endPage = pg;
+      } else {
+        break;
       }
     } catch (e) {
       // ignore
@@ -1249,7 +1396,21 @@ function isEditableElement(elNode) {
 }
 
 function handleReaderKeydown(e) {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    if (el.cmdPaletteModal && el.cmdPaletteModal.classList.contains("hidden")) {
+      openCommandPalette();
+    } else {
+      closeCommandPalette();
+    }
+    return;
+  }
+
   if (e.key === "Escape") {
+    if (el.cmdPaletteModal && !el.cmdPaletteModal.classList.contains("hidden")) {
+      closeCommandPalette();
+      return;
+    }
     if (el.shortcutsModal && !el.shortcutsModal.classList.contains("hidden")) {
       el.shortcutsModal.classList.add("hidden");
       return;
@@ -1336,6 +1497,18 @@ function handleReaderKeydown(e) {
   }
 }
 
+let _prefetchedChapterKey = "";
+function prefetchNextChapter() {
+  if (!state.activeBook) return;
+  const chapters = state.activeBook.manifest?.chapters || [];
+  const nextCh = chapters[state.currentChapterIndex + 1];
+  if (!nextCh || !nextCh.href) return;
+  const key = `${state.activeBook.id}::${nextCh.href}`;
+  if (_prefetchedChapterKey === key) return;
+  _prefetchedChapterKey = key;
+  fetch(`/epub/${encodeURIComponent(state.activeBook.id)}/${nextCh.href}`).catch(() => {});
+}
+
 function updateChapterProgressFooter() {
   if (!state.activeBook || !el.footerChapterProgress) return;
   const chapters = state.activeBook.manifest?.chapters || [];
@@ -1344,6 +1517,9 @@ function updateChapterProgressFooter() {
   const pct = Math.round(getIframeScrollPercent() * 100);
   if (el.chapterProgressBar) {
     el.chapterProgressBar.style.width = `${pct}%`;
+  }
+  if (pct >= 65) {
+    prefetchNextChapter();
   }
   const words = ch.word_count || 0;
   const minsLeft = words > 0 ? Math.max(1, Math.round(((words * (1 - pct / 100)) / 230))) : 0;
@@ -1387,14 +1563,25 @@ function attachIframeListeners() {
   }, { passive: true });
 
   updateChapterProgressFooter();
-  win.addEventListener("scroll", () => {
-    updateChapterProgressFooter();
-    hideHighlightMiniToolbar();
-    if (scrollSaveTimer) clearTimeout(scrollSaveTimer);
-    scrollSaveTimer = setTimeout(() => {
-      saveReadingProgress(getIframeScrollPercent());
-    }, 450);
-  });
+  let scrollRafPending = false;
+  win.addEventListener(
+    "scroll",
+    () => {
+      if (!scrollRafPending) {
+        scrollRafPending = true;
+        win.requestAnimationFrame(() => {
+          scrollRafPending = false;
+          updateChapterProgressFooter();
+          hideHighlightMiniToolbar();
+        });
+      }
+      if (scrollSaveTimer) clearTimeout(scrollSaveTimer);
+      scrollSaveTimer = setTimeout(() => {
+        saveReadingProgress(getIframeScrollPercent());
+      }, 450);
+    },
+    { passive: true }
+  );
 
   // Intercept internal chapter links & endnotes/footnotes inside the EPUB
   doc.querySelectorAll("a[href]").forEach((a) => {
@@ -1618,6 +1805,54 @@ async function saveReadingProgress(scrollPct = 0) {
 
 // --- Highlighting DOM Text in Iframe ---
 
+function buildDocumentTextIndex(doc) {
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+  const textNodes = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.nodeValue && node.nodeValue.length > 0 && isTextNodeVisible(node)) {
+      textNodes.push(node);
+    }
+  }
+
+  const chars = [];
+  const charMap = []; // index in normDoc -> { node, offset }
+  let lastWasSpace = true;
+
+  for (const tn of textNodes) {
+    const val = tn.nodeValue;
+    for (let i = 0; i < val.length; i++) {
+      const ch = val[i];
+      if (/\s/.test(ch)) {
+        if (!lastWasSpace) {
+          chars.push(" ");
+          charMap.push({ node: tn, offset: i });
+          lastWasSpace = true;
+        }
+      } else {
+        chars.push(ch);
+        charMap.push({ node: tn, offset: i });
+        lastWasSpace = false;
+      }
+    }
+  }
+
+  const normDoc = chars.join("");
+  return { normDoc, normDocLower: normDoc.toLowerCase(), charMap };
+}
+
+function findNthOccurrence(haystack, needle, occurrenceIndex = 0) {
+  let idx = -1;
+  let searchFrom = 0;
+  for (let n = 0; n <= occurrenceIndex; n++) {
+    const found = haystack.indexOf(needle, searchFrom);
+    if (found === -1) return idx;
+    idx = found;
+    searchFrom = found + 1;
+  }
+  return idx;
+}
+
 function applySavedHighlightsToIframe() {
   const doc = el.epubFrame.contentDocument;
   if (!doc || !doc.body || !state.activeBook) return;
@@ -1631,12 +1866,19 @@ function applySavedHighlightsToIframe() {
   });
 
   const chAnns = state.annotations.filter((a) => a.chapter_index === state.currentChapterIndex);
+  if (chAnns.length === 0) return;
+
+  // Build normalized document text index ONCE per chapter pass (avoids O(H * N) reflows)
+  const docIndex = buildDocumentTextIndex(doc);
+  const matches = [];
   let updatedAnyPage = false;
 
   for (const ann of chAnns) {
-    const detectedPage = highlightPhraseInDocument(doc, ann.selected_text, ann.color || "yellow", ann.id);
-    if (!ann.page_number && detectedPage) {
-      ann.page_number = detectedPage;
+    const match = resolveHighlightMatch(doc, docIndex, ann.selected_text, ann.occurrence_index || 0);
+    if (!match) continue;
+    matches.push({ ann, match });
+    if (!ann.page_number && match.detectedPage) {
+      ann.page_number = match.detectedPage;
       updatedAnyPage = true;
       // Backfill page number in SQLite silently
       fetch(`/api/books/${encodeURIComponent(state.activeBook.id)}/annotations`, {
@@ -1647,70 +1889,41 @@ function applySavedHighlightsToIframe() {
     }
   }
 
+  // Sort matches from end of document to start so DOM mutations never invalidate earlier text-node offsets
+  matches.sort((a, b) => b.match.matchIdx - a.match.matchIdx);
+  for (const { ann, match } of matches) {
+    wrapHighlightSegments(doc, match.segments, ann.color || "yellow", ann.id);
+  }
+
   if (updatedAnyPage) {
     renderAnnotationsList();
   }
 }
 
-function isTextNodeVisible(node, doc) {
+function isTextNodeVisible(node) {
   const parent = node?.parentElement;
   if (!parent) return false;
   if (parent.closest("[hidden], script, style, noscript, template")) return false;
-  const win = doc?.defaultView;
-  if (win && typeof win.getComputedStyle === "function") {
-    const cs = win.getComputedStyle(parent);
-    if (cs && (cs.display === "none" || cs.visibility === "hidden")) return false;
+  if (parent.style && (parent.style.display === "none" || parent.style.visibility === "hidden")) {
+    return false;
   }
   return true;
 }
 
-function highlightPhraseInDocument(doc, phrase, color, annId) {
+function resolveHighlightMatch(doc, docIndex, phrase, occurrenceIndex = 0) {
   if (!phrase || phrase.length < 2) return null;
-
-  // Build a normalized character stream across all visible text nodes in doc.body
-  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
-  const textNodes = [];
-  let node;
-  while ((node = walker.nextNode())) {
-    if (node.nodeValue && node.nodeValue.length > 0 && isTextNodeVisible(node, doc)) {
-      textNodes.push(node);
-    }
-  }
-
-  let normDoc = "";
-  const charMap = []; // index in normDoc -> { node, offset }
-  let lastWasSpace = true;
-
-  for (const tn of textNodes) {
-    const val = tn.nodeValue;
-    for (let i = 0; i < val.length; i++) {
-      const ch = val[i];
-      if (/\s/.test(ch)) {
-        if (!lastWasSpace) {
-          normDoc += " ";
-          charMap.push({ node: tn, offset: i });
-          lastWasSpace = true;
-        }
-      } else {
-        normDoc += ch;
-        charMap.push({ node: tn, offset: i });
-        lastWasSpace = false;
-      }
-    }
-  }
 
   const normTarget = phrase.replace(/\s+/g, " ").trim();
   if (!normTarget) return null;
 
-  let matchIdx = normDoc.indexOf(normTarget);
+  let matchIdx = findNthOccurrence(docIndex.normDoc, normTarget, occurrenceIndex);
   if (matchIdx === -1) {
-    // Case-insensitive fallback
-    matchIdx = normDoc.toLowerCase().indexOf(normTarget.toLowerCase());
+    matchIdx = findNthOccurrence(docIndex.normDocLower, normTarget.toLowerCase(), occurrenceIndex);
   }
   if (matchIdx === -1) return null;
 
   const endIdx = matchIdx + normTarget.length - 1;
-  if (endIdx >= charMap.length) return null;
+  if (endIdx >= docIndex.charMap.length) return null;
 
   // Group matched range by individual textNode segments so we can wrap across <i>, <a>, <sup>, etc.
   const segments = [];
@@ -1719,7 +1932,7 @@ function highlightPhraseInDocument(doc, phrase, color, annId) {
   let curEnd = 0;
 
   for (let k = matchIdx; k <= endIdx; k++) {
-    const entry = charMap[k];
+    const entry = docIndex.charMap[k];
     if (entry.node !== curNode) {
       if (curNode) {
         segments.push({ node: curNode, start: curStart, end: curEnd });
@@ -1748,10 +1961,15 @@ function highlightPhraseInDocument(doc, phrase, color, annId) {
     }
   }
 
+  return { matchIdx, endIdx, segments, detectedPage };
+}
+
+function wrapHighlightSegments(doc, segments, color, annId) {
   // Wrap segments in reverse order so earlier offsets in the same node aren't shifted
   for (let s = segments.length - 1; s >= 0; s--) {
     const seg = segments[s];
     try {
+      if (!seg.node.isConnected || seg.end > seg.node.nodeValue.length) continue;
       const r = doc.createRange();
       r.setStart(seg.node, seg.start);
       r.setEnd(seg.node, seg.end);
@@ -1768,8 +1986,6 @@ function highlightPhraseInDocument(doc, phrase, color, annId) {
       // ignore
     }
   }
-
-  return detectedPage;
 }
 
 function scrollToPhraseInIframe(phrase) {
@@ -1882,6 +2098,7 @@ function renderSingleAnnotationCard(ann) {
       }
       <div class="ann-actions">
         <button class="btn btn-xs btn-ghost" data-edit-ann="${escapeHtml(ann.id)}">Edit / Recode</button>
+        <button class="btn btn-xs btn-ghost" data-cite-ann="${escapeHtml(ann.id)}" title="Copy quote &amp; academic citation">Cite</button>
         <button class="btn btn-xs btn-ghost" data-ask-ann="${escapeHtml(ann.id)}">Ask Gemini</button>
         <button class="btn btn-xs btn-ghost" data-del-ann="${escapeHtml(ann.id)}">Delete</button>
       </div>
@@ -1985,6 +2202,23 @@ function renderAnnotationsList() {
     btn.addEventListener("click", () => {
       const ann = state.annotations.find((a) => a.id === btn.dataset.editAnn);
       if (ann) openAnnotationEditor(ann.selected_text, ann);
+    });
+  });
+
+  el.annotationsList.querySelectorAll("[data-cite-ann]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const ann = state.annotations.find((a) => a.id === btn.dataset.citeAnn);
+      if (!ann || !state.activeBook) return;
+      const author = (state.activeBook.author || "").trim();
+      const title = (state.activeBook.title || state.activeBook.name || "").trim();
+      const loc = ann.page_number || ann.chapter_title || `Section ${(ann.chapter_index || 0) + 1}`;
+      const citation = `"${(ann.selected_text || "").trim()}" (${author ? `${author}, ` : ""}${title}, ${loc})`;
+      try {
+        await navigator.clipboard.writeText(citation);
+        showToast("Copied quote & citation to clipboard!");
+      } catch (e) {
+        showToast("Could not copy citation.");
+      }
     });
   });
 
@@ -2171,19 +2405,20 @@ async function askGemini({ question = "", selectedText = "", action = "ask" }) {
   const scope = el.selectGeminiScope.value;
   const passage = selectedText || state.attachedPassage || "";
 
-  // Optimistic loading bubble
-  const tempEl = document.createElement("div");
-  tempEl.className = "chat-bubble chat-bubble-assistant";
-  tempEl.innerHTML = `<div style="display:flex;align-items:center;gap:8px;"><div class="spinner"></div><span>Gemini is reading & thinking...</span></div>`;
+  // Optimistic user + streaming assistant bubble
   const emptyState = el.chatMessages.querySelector(".chat-empty-state");
   if (emptyState) emptyState.remove();
+
+  const tempEl = document.createElement("div");
+  tempEl.className = "chat-bubble chat-bubble-assistant";
+  tempEl.innerHTML = `<div class="assistant-content" style="display:flex;align-items:center;gap:8px;"><div class="spinner"></div><span>Gemini is reading &amp; thinking...</span></div>`;
   el.chatMessages.appendChild(tempEl);
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 
   el.btnSendChat.disabled = true;
 
   try {
-    const res = await fetch(`/api/books/${encodeURIComponent(state.activeBook.id)}/gemini`, {
+    const res = await fetch(`/api/books/${encodeURIComponent(state.activeBook.id)}/gemini/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2196,21 +2431,74 @@ async function askGemini({ question = "", selectedText = "", action = "ask" }) {
         model: state.geminiModel,
       }),
     });
-    const data = await res.json();
-    tempEl.remove();
 
-    if (data.code === "MISSING_API_KEY") {
-      el.settingsModal.classList.remove("hidden");
-      el.inputGeminiKey.focus();
-      showToast("Please enter your Gemini API Key to ask Gemini questions.");
-      return;
+    if (!res.ok || !res.body) {
+      const errData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      tempEl.remove();
+      if (errData.code === "MISSING_API_KEY") {
+        el.settingsModal.classList.remove("hidden");
+        el.inputGeminiKey.focus();
+        showToast("Please enter your Gemini API Key to ask Gemini questions.");
+        return;
+      }
+      throw new Error(errData.error || `Gemini error (${res.status})`);
     }
-    if (data.error) throw new Error(data.error);
 
-    state.lastInteractionId = data.interaction_id || state.lastInteractionId;
-    state.chats.push(data.user_message, data.assistant_message);
-    attachSelectionToChat("");
-    renderChatMessages();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let streamedText = "";
+    let finalDone = null;
+    const contentDiv = tempEl.querySelector(".assistant-content");
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+
+      for (const block of parts) {
+        for (const line of block.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const jsonStr = line.slice(5).trim();
+          if (!jsonStr) continue;
+          let ev;
+          try {
+            ev = JSON.parse(jsonStr);
+          } catch {
+            continue;
+          }
+          if (ev.type === "error") {
+            tempEl.remove();
+            if (ev.code === "MISSING_API_KEY") {
+              el.settingsModal.classList.remove("hidden");
+              el.inputGeminiKey.focus();
+              showToast("Please enter your Gemini API Key to ask Gemini questions.");
+              return;
+            }
+            throw new Error(ev.error || "Gemini streaming error");
+          } else if (ev.type === "delta" && ev.text) {
+            streamedText += ev.text;
+            if (contentDiv) {
+              contentDiv.style.display = "block";
+              contentDiv.innerHTML = renderMarkdown(streamedText);
+            }
+            el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+          } else if (ev.type === "done") {
+            finalDone = ev;
+          }
+        }
+      }
+    }
+
+    tempEl.remove();
+    if (finalDone) {
+      state.lastInteractionId = finalDone.interaction_id || state.lastInteractionId;
+      state.chats.push(finalDone.user_message, finalDone.assistant_message);
+      attachSelectionToChat("");
+      renderChatMessages();
+    }
   } catch (e) {
     tempEl.remove();
     showToast(`Gemini error: ${e.message}`);
@@ -2288,9 +2576,10 @@ function initEventListeners() {
     if (state.activeBook) backToLibrary();
   });
   el.btnRefreshLibrary.addEventListener("click", () => fetchBooks(true));
+  const debouncedRenderLibrary = debounce(() => renderLibraryGrid(), 150);
   el.libraryFilterInput.addEventListener("input", (e) => {
     state.filterQuery = e.target.value;
-    renderLibraryGrid();
+    debouncedRenderLibrary();
   });
   if (el.libraryFolderSelect) {
     el.libraryFolderSelect.addEventListener("change", (e) => {
@@ -2511,9 +2800,10 @@ function initEventListeners() {
     });
   }
   if (el.annSearchInput) {
+    const debouncedRenderAnnotations = debounce(() => renderAnnotationsList(), 150);
     el.annSearchInput.addEventListener("input", (e) => {
       state.annSearchQuery = e.target.value;
-      renderAnnotationsList();
+      debouncedRenderAnnotations();
     });
   }
   if (el.selectAnnGroupBy) {
@@ -2593,6 +2883,7 @@ function initEventListeners() {
   el.btnOpenSettings.addEventListener("click", () => {
     el.settingsModal.classList.remove("hidden");
     refreshCacheStats();
+    refreshHiddenBooksSettings();
   });
   el.btnPruneCache?.addEventListener("click", async () => {
     el.btnPruneCache.disabled = true;
@@ -2665,14 +2956,14 @@ async function exportNotesToGoogleDoc() {
   }
 }
 
-async function generateArgumentMap() {
+async function generateArgumentMap(force = false) {
   if (!state.activeBook) return;
   const empty = el.chatMessages.querySelector(".chat-empty-state");
   if (empty) empty.remove();
 
   const loadingCard = document.createElement("div");
   loadingCard.className = "chat-bubble chat-bubble-assistant";
-  loadingCard.innerHTML = `<div class="assistant-content">🗺️ Mapping chapter thesis, key claims, terms, and critiques...</div>`;
+  loadingCard.innerHTML = `<div class="assistant-content">🗺️ ${force ? "Regenerating" : "Loading"} chapter thesis, key claims, terms, and critiques...</div>`;
   el.chatMessages.appendChild(loadingCard);
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 
@@ -2680,7 +2971,7 @@ async function generateArgumentMap() {
     const res = await fetch(`/api/books/${encodeURIComponent(state.activeBook.id)}/argument-map`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chapter_index: state.currentChapterIndex }),
+      body: JSON.stringify({ chapter_index: state.currentChapterIndex, force: Boolean(force) }),
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
@@ -2702,7 +2993,10 @@ async function generateArgumentMap() {
 
     loadingCard.innerHTML = `
       <div class="arg-map-card">
-        <div><strong>🗺️ Chapter Argument Map</strong> <span style="opacity:0.65;font-size:11px;">(${escapeHtml(data.model || "")})</span></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <div><strong>🗺️ Chapter Argument Map</strong> <span style="opacity:0.65;font-size:11px;">(${escapeHtml(data.model || "")}${data.cached ? " · saved" : ""})</span></div>
+          <button type="button" class="btn btn-xs btn-ghost btn-regen-argmap" title="Regenerate with Gemini">↻ Regenerate</button>
+        </div>
         ${m.thesis ? `<div class="arg-map-section"><h4>Thesis</h4><div>${escapeHtml(m.thesis)}</div></div>` : ""}
         ${(m.key_claims || []).length ? `<div class="arg-map-section"><h4>Key Claims</h4>${renderItems(m.key_claims, "role", "claim")}</div>` : ""}
         ${(m.key_terms || []).length ? `<div class="arg-map-section"><h4>Key Terms</h4>${renderItems(m.key_terms, "term", "definition")}</div>` : ""}
@@ -2712,6 +3006,10 @@ async function generateArgumentMap() {
       btn.addEventListener("click", () => {
         scrollToPhraseInIframe(btn.dataset.jumpQuote);
       });
+    });
+    loadingCard.querySelector(".btn-regen-argmap")?.addEventListener("click", () => {
+      loadingCard.remove();
+      generateArgumentMap(true);
     });
   } catch (e) {
     loadingCard.innerHTML = `<div class="assistant-content">Argument map failed: ${escapeHtml(e.message)}</div>`;
@@ -2995,6 +3293,192 @@ function initNewUiControls() {
   });
 }
 
+// --- Command Palette (Cmd/Ctrl+K) ---
+
+let _cmdItems = [];
+let _cmdActiveIdx = 0;
+
+function openCommandPalette() {
+  if (!el.cmdPaletteModal || !el.cmdPaletteInput) return;
+  el.cmdPaletteModal.classList.remove("hidden");
+  el.cmdPaletteInput.value = "";
+  _cmdActiveIdx = 0;
+  renderCommandPalette("");
+  el.cmdPaletteInput.focus();
+}
+
+function closeCommandPalette() {
+  el.cmdPaletteModal?.classList.add("hidden");
+}
+
+function buildCommandPaletteLocalItems(q) {
+  const ql = q.toLowerCase().trim();
+  const groups = [];
+
+  if (state.activeBook) {
+    const chapters = state.activeBook.manifest?.chapters || [];
+    const chMatches = chapters
+      .filter((c) => !ql || (c.title || "").toLowerCase().includes(ql))
+      .slice(0, 6)
+      .map((c) => ({
+        title: c.title || `Section ${c.index + 1}`,
+        sub: `Current book · Section ${c.index + 1}`,
+        badge: "Chapter",
+        run: () => loadChapter(c.index),
+      }));
+    if (chMatches.length) groups.push({ label: "Chapters in Current Book", items: chMatches });
+  }
+
+  const bookMatches = state.books
+    .filter((b) => {
+      if (!ql) return Boolean(b.last_opened_at);
+      return (
+        (b.title || "").toLowerCase().includes(ql) ||
+        (b.author || "").toLowerCase().includes(ql) ||
+        (b.name || "").toLowerCase().includes(ql)
+      );
+    })
+    .slice(0, ql ? 8 : 5)
+    .map((b) => ({
+      title: b.title || b.name,
+      sub: b.author || b.folder_path || "EPUB",
+      badge: b.downloaded ? "Cached" : "Drive",
+      run: () => openBook(b.id),
+    }));
+  if (bookMatches.length) groups.push({ label: ql ? "Library Books" : "Recent Books", items: bookMatches });
+
+  const actions = [
+    ...(state.activeBook
+      ? [
+          { title: "Toggle Focus / Zen Mode", sub: "Shortcut: f", badge: "Action", run: () => document.body.classList.toggle("focus-mode") },
+          { title: "Generate Chapter Argument Map", sub: "Gemini thesis, claims & terms", badge: "Action", run: () => { switchRightTab("gemini"); generateArgumentMap(false); } },
+          { title: "Sync Highlights to Google Drive", sub: "Upload .annotations.json & - Notes.md", badge: "Action", run: () => syncAnnotationsToGoogleDrive() },
+          { title: "Back to Library", sub: "Return to book grid", badge: "Action", run: () => backToLibrary() },
+        ]
+      : []),
+    { title: "Compare Books with Gemini", sub: "Cross-book concept synthesis", badge: "Action", run: () => openCompareModal() },
+    { title: "Open Settings", sub: "Gemini API key, OAuth, cache", badge: "Action", run: () => el.btnOpenSettings?.click() },
+  ].filter((a) => !ql || a.title.toLowerCase().includes(ql) || a.sub.toLowerCase().includes(ql));
+  if (actions.length) groups.push({ label: "Quick Actions", items: actions });
+
+  return groups;
+}
+
+function paintCommandPaletteGroups(groups) {
+  if (!el.cmdPaletteResults) return;
+  _cmdItems = [];
+  if (groups.length === 0) {
+    el.cmdPaletteResults.innerHTML = `<p class="muted-hint" style="padding:12px;">No matches found.</p>`;
+    return;
+  }
+  let html = "";
+  for (const g of groups) {
+    html += `<div class="cmd-palette-group">${escapeHtml(g.label)}</div>`;
+    for (const item of g.items) {
+      const idx = _cmdItems.length;
+      _cmdItems.push(item);
+      html += `
+        <div class="cmd-palette-item ${idx === _cmdActiveIdx ? "active" : ""}" data-cmd-idx="${idx}">
+          <div class="cmd-palette-item-main">
+            <div class="cmd-palette-item-title">${escapeHtml(item.title)}</div>
+            <div class="cmd-palette-item-sub">${escapeHtml(item.sub || "")}</div>
+          </div>
+          <span class="cmd-palette-item-badge">${escapeHtml(item.badge || "")}</span>
+        </div>`;
+    }
+  }
+  el.cmdPaletteResults.innerHTML = html;
+  el.cmdPaletteResults.querySelectorAll(".cmd-palette-item").forEach((row) => {
+    row.addEventListener("click", () => {
+      const idx = parseInt(row.dataset.cmdIdx, 10);
+      const item = _cmdItems[idx];
+      if (item) {
+        closeCommandPalette();
+        item.run();
+      }
+    });
+  });
+}
+
+let _cmdSearchSeq = 0;
+function renderCommandPalette(q) {
+  _cmdActiveIdx = 0;
+  const localGroups = buildCommandPaletteLocalItems(q);
+  paintCommandPaletteGroups(localGroups);
+
+  const trimmed = q.trim();
+  if (trimmed.length < 3) return;
+  const seq = ++_cmdSearchSeq;
+  fetch(`/api/search?q=${encodeURIComponent(trimmed)}`)
+    .then((r) => r.json())
+    .then((data) => {
+      if (seq !== _cmdSearchSeq || el.cmdPaletteModal?.classList.contains("hidden")) return;
+      const extraGroups = [...localGroups];
+      const anns = (data.annotation_matches || []).slice(0, 5);
+      if (anns.length) {
+        extraGroups.push({
+          label: "Highlights & Notes (FTS5)",
+          items: anns.map((a) => ({
+            title: `"${(a.selected_text || "").slice(0, 80)}"`,
+            sub: `${a.book_title || a.book_name} · ${a.chapter_title || ""}`,
+            badge: "Highlight",
+            run: () => openBook(a.book_id, { chapterIndex: a.chapter_index, highlightPhrase: (a.selected_text || "").slice(0, 60) }),
+          })),
+        });
+      }
+      const bms = (data.book_matches || []).slice(0, 5);
+      if (bms.length) {
+        extraGroups.push({
+          label: "Full-Text Passages (FTS5)",
+          items: bms.map((m) => ({
+            title: m.book_title,
+            sub: `${m.chapter_title}: ${(m.snippet || "").slice(0, 90)}`,
+            badge: "Passage",
+            run: () => openBook(m.book_id, { chapterIndex: m.chapter_index, highlightPhrase: trimmed }),
+          })),
+        });
+      }
+      paintCommandPaletteGroups(extraGroups);
+    })
+    .catch(() => {});
+}
+
+function initCommandPalette() {
+  if (!el.cmdPaletteModal || !el.cmdPaletteInput) return;
+  el.cmdPaletteModal.addEventListener("click", (e) => {
+    if (e.target === el.cmdPaletteModal) closeCommandPalette();
+  });
+  const debouncedCmd = debounce((val) => renderCommandPalette(val), 140);
+  el.cmdPaletteInput.addEventListener("input", (e) => debouncedCmd(e.target.value));
+  el.cmdPaletteInput.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (_cmdItems.length) {
+        _cmdActiveIdx = (_cmdActiveIdx + 1) % _cmdItems.length;
+        el.cmdPaletteResults.querySelectorAll(".cmd-palette-item").forEach((n, i) => n.classList.toggle("active", i === _cmdActiveIdx));
+        el.cmdPaletteResults.querySelector(".cmd-palette-item.active")?.scrollIntoView({ block: "nearest" });
+      }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (_cmdItems.length) {
+        _cmdActiveIdx = (_cmdActiveIdx - 1 + _cmdItems.length) % _cmdItems.length;
+        el.cmdPaletteResults.querySelectorAll(".cmd-palette-item").forEach((n, i) => n.classList.toggle("active", i === _cmdActiveIdx));
+        el.cmdPaletteResults.querySelector(".cmd-palette-item.active")?.scrollIntoView({ block: "nearest" });
+      }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const item = _cmdItems[_cmdActiveIdx];
+      if (item) {
+        closeCommandPalette();
+        item.run();
+      }
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeCommandPalette();
+    }
+  });
+}
+
 // --- Boot ---
 (async function init() {
   applyTheme(state.theme);
@@ -3002,6 +3486,7 @@ function initNewUiControls() {
   initEventListeners();
   initNewUiControls();
   initSidebarResizers();
+  initCommandPalette();
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }

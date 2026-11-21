@@ -2117,3 +2117,192 @@ body.focus-mode .exit-focus-btn {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- Command Palette (Cmd/Ctrl+K) --- */
+.cmd-palette-card {
+  width: min(620px, 92vw);
+  max-height: 72vh;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  margin-top: -10vh;
+}
+.cmd-palette-input-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+.cmd-palette-icon {
+  font-size: 15px;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.cmd-palette-input-row input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-main);
+  font-size: 15px;
+}
+.cmd-palette-kbd {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-muted);
+}
+.cmd-palette-results {
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cmd-palette-group {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 8px 10px 4px;
+}
+.cmd-palette-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--text-main);
+  font-size: 13px;
+}
+.cmd-palette-item:hover,
+.cmd-palette-item.active {
+  background: var(--bg-hover, rgba(140, 74, 39, 0.1));
+}
+.cmd-palette-item-main {
+  min-width: 0;
+  flex: 1;
+}
+.cmd-palette-item-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmd-palette-item-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmd-palette-item-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* --- Remove Book Button, Undo Toast & Hidden Books Manager --- */
+.btn-remove-book {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 6;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  background: rgba(255, 255, 255, 0.92);
+  color: #4b5563;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.45;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.book-card:hover .btn-remove-book,
+.book-card:focus-within .btn-remove-book,
+.btn-remove-book:focus {
+  opacity: 1;
+}
+.btn-remove-book:hover {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #ffffff;
+}
+.btn-remove-book-inline {
+  position: static;
+  opacity: 0.55;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+}
+.library-list-row:hover .btn-remove-book-inline {
+  opacity: 1;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.toast-undo-btn {
+  background: rgba(255, 255, 255, 0.18);
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.toast-undo-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+.hidden-books-list {
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hidden-book-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-app);
+  font-size: 12px;
+}
+.hidden-book-info {
+  min-width: 0;
+  flex: 1;
+}
+.hidden-book-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hidden-book-author {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

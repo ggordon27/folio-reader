@@ -8,7 +8,7 @@
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <title>Folio — Google Drive EPUB Reader & Gemini Companion</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=4" />
 </head>
 <body>
   <!-- TOP HEADER BAR -->
@@ -578,7 +578,12 @@
           <button type="button" id="btnPruneCache" class="btn btn-secondary btn-sm">
             🧹 Clear EPUBs Unopened 10+ Days
           </button>
-          <p class="form-help">Removes unpacked EPUB files to free disk space. Your highlights, notes, tags, and reading progress are always preserved.</p>
+          <p class="form-help">Removes cached EPUB files to free disk space. Your highlights, notes, tags, and reading progress are always preserved.</p>
+        </div>
+        <div class="form-group">
+          <label>Removed / Hidden Books <span id="hiddenBooksCount" style="font-weight:400; color:var(--text-muted);">(0)</span></label>
+          <p class="form-help" style="margin-bottom:8px;">Books removed from your library stay hidden across Google Drive syncs (files in Drive are never deleted).</p>
+          <div id="hiddenBooksList" class="hidden-books-list"></div>
         </div>
       </div>
       <div class="modal-footer">
@@ -621,6 +626,7 @@
           <div class="shortcut-row"><kbd>[</kbd> / <kbd>]</kbd><span>Toggle Left / Right sidebar</span></div>
           <div class="shortcut-row"><kbd>b</kbd><span>Add bookmark at current scroll position</span></div>
           <div class="shortcut-row"><kbd>f</kbd><span>Toggle Focus / Zen reading mode</span></div>
+          <div class="shortcut-row"><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd><span>Open Command Palette (books, chapters, FTS5 search)</span></div>
           <div class="shortcut-row"><kbd>Esc</kbd><span>Dismiss popovers &amp; modals</span></div>
           <div class="shortcut-row"><kbd>?</kbd><span>Toggle this shortcuts cheatsheet</span></div>
         </div>
@@ -668,9 +674,21 @@
     </div>
   </div>
 
+  <!-- MODAL: COMMAND PALETTE (Cmd/Ctrl+K) -->
+  <div id="cmdPaletteModal" class="modal-backdrop hidden">
+    <div class="cmd-palette-card">
+      <div class="cmd-palette-input-row">
+        <span class="cmd-palette-icon">⌘</span>
+        <input type="text" id="cmdPaletteInput" placeholder="Jump to book, chapter, highlight, or search full text..." autocomplete="off" />
+        <kbd class="cmd-palette-kbd">Esc</kbd>
+      </div>
+      <div id="cmdPaletteResults" class="cmd-palette-results"></div>
+    </div>
+  </div>
+
   <!-- Toast notification container -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=4"></script>
 </body>
 </html>
