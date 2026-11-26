@@ -220,6 +220,10 @@
         }).promise;
       }
 
+      const endOfContent = document.createElement("div");
+      endOfContent.className = "endOfContent";
+      textLayerDiv.appendChild(endOfContent);
+
       const badge = document.createElement("div");
       badge.className = "pdf-page-badge";
       badge.textContent = `p. ${pageNum}`;
@@ -499,11 +503,28 @@
       { passive: false }
     );
 
+    // Prevent erratic cross-line selection snapping using PDF.js's endOfContent guard
+    wrap?.addEventListener("mousedown", (e) => {
+      wrap.querySelectorAll(".textLayer .endOfContent.active").forEach((el) => el.classList.remove("active"));
+      const tl = e.target?.closest?.(".textLayer");
+      const eoc = tl?.querySelector(".endOfContent");
+      if (eoc) eoc.classList.add("active");
+    });
+
     // Text selection inside PDF textLayer -> trigger Folio's selectionPopover
-    wrap?.addEventListener("mouseup", () => {
+    document.addEventListener("mouseup", (e) => {
+      wrap?.querySelectorAll(".textLayer .endOfContent.active").forEach((el) => el.classList.remove("active"));
+      const { container } = _els();
+      if (!pdfState.doc || !container || container.classList.contains("hidden")) return;
+      if (e.target?.closest?.("#selectionPopover")) return;
       setTimeout(() => {
         const sel = window.getSelection();
-        if (!sel || sel.isCollapsed) return;
+        if (!sel || sel.isCollapsed) {
+          if (e.target?.closest?.("#pdfPagesScroll") && typeof pdfState.callbacks.onTextClear === "function") {
+            pdfState.callbacks.onTextClear();
+          }
+          return;
+        }
         const text = sel.toString().trim();
         if (text.length < 2) return;
         const anchorNode = sel.anchorNode;

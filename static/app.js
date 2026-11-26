@@ -1172,6 +1172,10 @@ async function openBook(bookId, opts = {}) {
             state.selectedPageNumber = pageNumber;
             el.selectionPopover?.classList.remove("hidden");
           },
+          onTextClear: () => {
+            state.selectedText = "";
+            hideSelectionPopover();
+          },
         }
       );
     } else {
@@ -2252,6 +2256,7 @@ async function quickHighlightSelection(color) {
   await saveAnnotationToServer(payload);
   hideSelectionPopover();
   el.epubFrame.contentWindow?.getSelection()?.removeAllRanges();
+  window.getSelection()?.removeAllRanges();
 }
 
 function openAnnotationEditor(selectedText, existingAnn = null) {

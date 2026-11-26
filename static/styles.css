@@ -2522,15 +2522,47 @@ body.focus-mode .exit-focus-btn {
 .pdf-page-slot .textLayer {
   position: absolute;
   inset: 0;
-  opacity: 1;
+  opacity: 0.25;
   line-height: 1;
   pointer-events: auto;
   z-index: 2;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
 }
 
-.pdf-page-slot .textLayer span {
+.pdf-page-slot .textLayer span,
+.pdf-page-slot .textLayer br {
   color: transparent;
   cursor: text;
+}
+
+.pdf-page-slot .textLayer ::selection,
+.pdf-page-slot .textLayer span::selection {
+  background: #2563eb;
+  color: transparent;
+}
+
+[data-theme="dark"] .pdf-page-slot .textLayer ::selection,
+[data-theme="dark"] .pdf-page-slot .textLayer span::selection {
+  background: #60a5fa;
+  color: transparent;
+}
+
+.pdf-page-slot .textLayer br::selection {
+  background: transparent;
+}
+
+.pdf-page-slot .textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: -1;
+  cursor: default;
+  user-select: none;
+}
+
+.pdf-page-slot .textLayer .endOfContent.active {
+  top: 0;
 }
 
 .pdf-page-slot .textLayer span.folio-pdf-hl {
@@ -2565,6 +2597,7 @@ body.focus-mode .exit-focus-btn {
   background: rgba(20, 20, 20, 0.58);
   color: #fff;
   pointer-events: none;
+  user-select: none;
 }
 
 /* Uncompiled Chapter-Only Books Modal */

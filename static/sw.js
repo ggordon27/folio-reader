@@ -1,4 +1,4 @@
-const SHELL_CACHE = "folio-shell-v3";
+const SHELL_CACHE = "folio-shell-v4";
 const EPUB_CACHE = "folio-epub-v2";
 const SHELL_ASSETS = ["/", "/styles.css", "/app.js", "/icon.svg", "/manifest.json"];
 
