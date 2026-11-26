@@ -6,11 +6,12 @@ import html as html_mod
 import json
 import os
 import re
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from .config import BASE_DIR, DB_PATH, ensure_data_dirs, migrate_legacy_data_if_needed
+from .config import BASE_DIR, BOOKS_DIR, COVERS_DIR, DATA_DIR, DB_PATH, ensure_data_dirs, migrate_legacy_data_if_needed
 
 
 def get_db() -> sqlite3.Connection:
@@ -45,11 +46,66 @@ def compute_progress_summary(
     return ch_count, total_words, ch_title, pct
 
 
+def _reclaim_disk_space_if_needed(min_free_mb: int = 200):
+    """
+    Protects reader.db from SQLite 'disk I/O error' when a mounted volume fills up.
+    Only removes 100% re-downloadable caches (covers/, then books/) — never touches reader.db.
+    """
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+        free_mb = usage.free / (1024 * 1024)
+        total_mb = usage.total / (1024 * 1024)
+        print(f"Folio volume disk usage: {free_mb:.1f} MB free / {total_mb:.1f} MB total", flush=True)
+    except OSError:
+        return
+
+    if free_mb >= min_free_mb:
+        return
+
+    print(f"Low disk space ({free_mb:.1f} MB free < {min_free_mb} MB) — pruning regeneratable caches...", flush=True)
+    # 1. Prune cover thumbnails first (100% regeneratable)
+    if COVERS_DIR.is_dir():
+        removed_covers = 0
+        for p in COVERS_DIR.iterdir():
+            if p.is_file():
+                try:
+                    p.unlink()
+                    removed_covers += 1
+                except OSError:
+                    pass
+        print(f"Pruned {removed_covers} cached cover thumbnails.", flush=True)
+
+    # 2. If still low, prune cached book archives (100% re-downloadable from Drive)
+    try:
+        free_mb = shutil.disk_usage(DATA_DIR).free / (1024 * 1024)
+    except OSError:
+        return
+    if free_mb < min_free_mb and BOOKS_DIR.is_dir():
+        removed_books = 0
+        for bdir in BOOKS_DIR.iterdir():
+            if bdir.is_dir():
+                shutil.rmtree(bdir, ignore_errors=True)
+                removed_books += 1
+        print(f"Pruned {removed_books} cached book directories.", flush=True)
+
+
 def init_db():
     ensure_data_dirs()
     migrate_legacy_data_if_needed()
+    _reclaim_disk_space_if_needed(min_free_mb=200)
 
-    conn = get_db()
+    try:
+        conn = get_db()
+    except sqlite3.OperationalError as exc:
+        print(f"SQLite open warning ({exc}) — attempting WAL/SHM recovery...", flush=True)
+        _reclaim_disk_space_if_needed(min_free_mb=500)
+        shm_path = Path(f"{DB_PATH}-shm")
+        if shm_path.exists():
+            try:
+                shm_path.unlink()
+            except OSError:
+                pass
+        conn = get_db()
     try:
         with conn:
             conn.execute("PRAGMA journal_mode=WAL")
