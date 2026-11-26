@@ -40,12 +40,56 @@
     };
   }
 
-  function _computeFitScale() {
+  function _computeFitScale(targetWidth = null) {
     const { scroll } = _els();
     if (!scroll) return 1.25;
     const avail = Math.max(320, scroll.clientWidth - 48);
-    const raw = avail / Math.max(200, pdfState.baseViewportWidth);
-    return Math.max(0.6, Math.min(2.2, raw));
+    const refW = Math.max(200, targetWidth || pdfState.baseViewportWidth);
+    const raw = avail / refW;
+    return Math.max(0.6, Math.min(3.0, raw));
+  }
+
+  async function _measureMedianBodyViewport(doc) {
+    const n = doc.numPages || 1;
+    // Sample interior pages (skipping page 1 when n > 2 so oversized Project MUSE / JSTOR cover sheets don't skew Fit Width)
+    const sampleIndices = n <= 2
+      ? Array.from({ length: n }, (_, i) => i + 1)
+      : Array.from(new Set([
+          2,
+          Math.min(n, 4),
+          Math.min(n, Math.max(5, Math.floor(n * 0.25))),
+          Math.min(n, Math.max(6, Math.floor(n * 0.5))),
+          Math.min(n, Math.max(7, Math.floor(n * 0.75))),
+        ]));
+    const widths = [];
+    const heights = [];
+    for (const pno of sampleIndices) {
+      try {
+        const pg = await doc.getPage(pno);
+        const vp = pg.getViewport({ scale: 1.0 });
+        if (vp.width > 100 && vp.height > 100) {
+          widths.push(vp.width);
+          heights.push(vp.height);
+        }
+      } catch (_) {}
+    }
+    if (!widths.length) return { width: 612, height: 792 };
+    widths.sort((a, b) => a - b);
+    heights.sort((a, b) => a - b);
+    const mid = Math.floor(widths.length / 2);
+    return { width: widths[mid], height: heights[mid] };
+  }
+
+  async function fitCurrentPageWidth() {
+    if (!pdfState.doc) return;
+    let refWidth = pdfState.baseViewportWidth;
+    try {
+      const pno = pdfState.currentPage === 1 && pdfState.pageCount > 2 ? 2 : pdfState.currentPage;
+      const pg = await pdfState.doc.getPage(pno);
+      const vp = pg.getViewport({ scale: 1.0 });
+      if (vp.width > 100) refWidth = vp.width;
+    } catch (_) {}
+    await setScale(_computeFitScale(refWidth), true);
   }
 
   function _updateToolbar() {
@@ -297,7 +341,7 @@
   async function setScale(newScale, isFitWidth = false) {
     const curPage = pdfState.currentPage;
     pdfState.fitWidth = isFitWidth;
-    pdfState.scale = Math.max(0.5, Math.min(2.6, newScale));
+    pdfState.scale = Math.max(0.5, Math.min(3.5, newScale));
     _updateToolbar();
     _buildPlaceholders();
     scrollToPage(curPage, { instant: true });
@@ -318,11 +362,10 @@
     pdfState.doc = doc;
     pdfState.pageCount = doc.numPages || 1;
 
-    const firstPage = await doc.getPage(1);
-    const baseVp = firstPage.getViewport({ scale: 1.0 });
-    pdfState.baseViewportWidth = baseVp.width || 612;
-    pdfState.baseViewportHeight = baseVp.height || 792;
-    pdfState.scale = _computeFitScale();
+    const bodyVp = await _measureMedianBodyViewport(doc);
+    pdfState.baseViewportWidth = bodyVp.width || 612;
+    pdfState.baseViewportHeight = bodyVp.height || 792;
+    pdfState.scale = _computeFitScale(pdfState.baseViewportWidth);
     pdfState.fitWidth = true;
 
     const startPage = Math.max(1, Math.min(pdfState.pageCount, opts.startPage || 1));
@@ -370,7 +413,47 @@
 
     btnZoomOut?.addEventListener("click", () => setScale(pdfState.scale - 0.15, false));
     btnZoomIn?.addEventListener("click", () => setScale(pdfState.scale + 0.15, false));
-    btnFitWidth?.addEventListener("click", () => setScale(_computeFitScale(), true));
+    btnFitWidth?.addEventListener("click", () => fitCurrentPageWidth());
+
+    // Keyboard & keypad zoom shortcuts (+ / = / NumpadAdd, - / NumpadSubtract, 0 / Numpad0)
+    document.addEventListener("keydown", (e) => {
+      const { container } = _els();
+      if (!pdfState.doc || !container || container.classList.contains("hidden")) return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) {
+        return;
+      }
+      if (e.key === "+" || e.key === "=" || e.code === "NumpadAdd") {
+        e.preventDefault();
+        setScale(pdfState.scale + 0.15, false);
+      } else if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") {
+        e.preventDefault();
+        setScale(pdfState.scale - 0.15, false);
+      } else if (e.key === "0" || e.code === "Numpad0") {
+        e.preventDefault();
+        fitCurrentPageWidth();
+      }
+    });
+
+    // Trackpad pinch-zoom / Ctrl+wheel inside PDF viewer
+    let wheelZoomTimer = null;
+    let pendingWheelScale = null;
+    scroll.addEventListener(
+      "wheel",
+      (e) => {
+        if (!pdfState.doc || !(e.ctrlKey || e.metaKey)) return;
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? 0.12 : -0.12;
+        pendingWheelScale = Math.max(0.5, Math.min(3.5, (pendingWheelScale ?? pdfState.scale) + delta));
+        if (wheelZoomTimer) clearTimeout(wheelZoomTimer);
+        wheelZoomTimer = setTimeout(() => {
+          const target = pendingWheelScale;
+          pendingWheelScale = null;
+          if (target !== null) setScale(target, false);
+        }, 90);
+      },
+      { passive: false }
+    );
 
     // Text selection inside PDF textLayer -> trigger Folio's selectionPopover
     wrap?.addEventListener("mouseup", () => {
