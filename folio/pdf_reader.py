@@ -9,6 +9,7 @@ import shutil
 import statistics
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -246,16 +247,362 @@ def render_pdf_cover(pdf_path: Path, max_width: int = 420) -> Optional[bytes]:
         return None
 
 
+PDF_TOC_VERSION = 2
+
+_ROMAN_MAP = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+
+
+def _roman_to_int(s: str) -> Optional[int]:
+    s = (s or "").strip().lower()
+    if not s or not re.match(r"^[ivxlcdm]+$", s):
+        return None
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        val = _ROMAN_MAP[ch]
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total if 1 <= total <= 200 else None
+
+
+def _clean_line(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
+
+
+def _estimate_folio_offsets(doc: fitz.Document) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Estimates (arabic_offset, roman_offset) where:
+      pdf_page_1based = printed_page + offset
+    by sampling header/footer page folios across the document.
+    """
+    page_count = len(doc)
+    arabic_offsets: Counter = Counter()
+    roman_offsets: Counter = Counter()
+
+    # Sample roman folios in first 35 pages
+    for idx in range(min(page_count, 35)):
+        page = doc[idx]
+        h = page.rect.height
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                _, y0, _, y1 = ln["bbox"]
+                if not (y1 < h * 0.14 or y0 > h * 0.86):
+                    continue
+                txt = _clean_line("".join(s.get("text", "") for s in ln.get("spans", [])))
+                m_rom = re.match(r"^([ivxlcdm]{1,6})$", txt, re.IGNORECASE)
+                if m_rom:
+                    rval = _roman_to_int(m_rom.group(1))
+                    if rval and 1 <= rval <= 60:
+                        off = (idx + 1) - rval
+                        if -5 <= off <= 25:
+                            roman_offsets[off] += 1
+
+    # Sample arabic folios across pages 5..min(page_count, 90)
+    start_i = min(5, page_count // 6)
+    end_i = min(page_count, start_i + 80)
+    for idx in range(start_i, end_i):
+        page = doc[idx]
+        h = page.rect.height
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                _, y0, _, y1 = ln["bbox"]
+                if not (y1 < h * 0.14 or y0 > h * 0.86):
+                    continue
+                txt = _clean_line("".join(s.get("text", "") for s in ln.get("spans", [])))
+                m = (
+                    re.match(r"^(\d{1,4})$", txt)
+                    or re.search(r"(?:^|\s)(\d{1,4})$", txt)
+                    or re.match(r"^(\d{1,4})\s+", txt)
+                )
+                if m:
+                    printed = int(m.group(1))
+                    if 1 <= printed <= page_count:
+                        off = (idx + 1) - printed
+                        if -20 <= off <= 80:
+                            arabic_offsets[off] += 1
+
+    best_arabic = None
+    if arabic_offsets:
+        val, cnt = arabic_offsets.most_common(1)[0]
+        if cnt >= 3:
+            best_arabic = val
+
+    best_roman = None
+    if roman_offsets:
+        val, cnt = roman_offsets.most_common(1)[0]
+        if cnt >= 2:
+            best_roman = val
+
+    return best_arabic, best_roman
+
+
+def _format_toc_title(raw: str) -> str:
+    t = _clean_line(raw).strip(" .·•-–—:")
+    if not t:
+        return ""
+    # Fix OCR/PDF hyphenation artifacts like "Acknowl edgments" -> keep normal spaces, collapse stray internal splits
+    letters = [c for c in t if c.isalpha()]
+    all_caps = bool(letters and sum(1 for c in letters if c.isupper()) / len(letters) > 0.85 and len(t) > 4)
+    # Detect PDF small-caps encoding glitches like "StapLe beCOmingS", "intrOduCtiOn", "COnCLuSiOn"
+    weird_smallcaps = bool(re.search(r"[a-z][A-Z]{1,}[a-z]|[a-z][A-Z]$|^[a-z].*[A-Z]", t))
+    if all_caps or weird_smallcaps:
+        small = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with"}
+        words = t.lower().split()
+        out = []
+        for wi, w in enumerate(words):
+            if wi > 0 and w in small:
+                out.append(w)
+            elif w.startswith("(") and len(w) > 1:
+                out.append("(" + w[1:2].upper() + w[2:])
+            else:
+                out.append(w[:1].upper() + w[1:])
+        t = " ".join(out)
+    return t
+
+
+def _detect_toc_from_printed_contents(doc: fitz.Document) -> List[Tuple[int, str, int]]:
+    """
+    Tier 2: Parses a printed Table of Contents in the first ~25 pages and maps
+    printed page numbers (arabic & roman) to 1-based PDF page numbers.
+    Returns list of (level, title, pdf_page_1based).
+    """
+    page_count = len(doc)
+    if page_count < 10:
+        return []
+
+    scan_limit = min(page_count, 25)
+    toc_pages: List[int] = []
+    for i in range(scan_limit):
+        txt = doc[i].get_text("text") or ""
+        lines = [_clean_line(l) for l in txt.splitlines() if l.strip()]
+        if any(re.match(r"^(?:table\s+of\s+)?contents$", l, re.IGNORECASE) for l in lines[:8]):
+            toc_pages.append(i)
+            for nxt in range(i + 1, min(i + 5, scan_limit)):
+                nxt_lines = [_clean_line(l) for l in (doc[nxt].get_text("text") or "").splitlines() if l.strip()]
+                num_endings = sum(
+                    1 for l in nxt_lines if re.search(r"(?:\s|\.{2,})(?:\d{1,4}|[ivxlcdm]{1,6})$", l, re.IGNORECASE)
+                )
+                if num_endings >= 3:
+                    toc_pages.append(nxt)
+                else:
+                    break
+            break
+
+    if not toc_pages:
+        return []
+
+    arabic_off, roman_off = _estimate_folio_offsets(doc)
+    if arabic_off is None:
+        return []
+
+    # Reconstruct visual lines from text dict (preserving column order on each y-band)
+    raw_lines: List[str] = []
+    for p_idx in toc_pages:
+        blocks = doc[p_idx].get_text("dict").get("blocks", [])
+        y_rows: List[Tuple[float, float, str]] = []
+        for b in blocks:
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                x0, y0, x1, y1 = ln["bbox"]
+                txt = _clean_line("".join(s.get("text", "") for s in ln.get("spans", [])))
+                if txt:
+                    y_rows.append((y0, x0, txt))
+        y_rows.sort(key=lambda r: (round(r[0] / 4.0), r[1]))
+
+        # Group spans on the same visual horizontal line (within ~4pt)
+        grouped: List[List[Tuple[float, str]]] = []
+        last_y: Optional[float] = None
+        for y0, x0, txt in y_rows:
+            if last_y is None or abs(y0 - last_y) > 4.5:
+                grouped.append([(x0, txt)])
+                last_y = y0
+            else:
+                grouped[-1].append((x0, txt))
+
+        for row in grouped:
+            row.sort(key=lambda r: r[0])
+            # Join with double-space when there's a noticeable x-gap so multi-entry lines stay splittable
+            joined = "  ".join(t for _, t in row)
+            raw_lines.append(joined)
+
+    # Parse entries (including multi-entry lines like "Notes 239  References 271  Index 289")
+    multi_back_re = re.compile(
+        r"\b(Notes|Endnotes|References|Bibliography|Works Cited|Index|Glossary|Appendix(?:\s+[A-Z0-9]+)?|Acknowledgments?|Preface|Conclusion|Epilogue)\s+(\d{1,4})\b",
+        re.IGNORECASE,
+    )
+
+    entries: List[Tuple[int, str, int]] = []
+    pending_prefix = ""
+    toc_end_1based = toc_pages[-1] + 1
+
+    for line in raw_lines:
+        clean = _clean_line(line)
+        if not clean or re.match(r"^(?:table\s+of\s+)?contents$", clean, re.IGNORECASE):
+            continue
+        # Skip standalone page numbers (folio of the TOC page itself)
+        if re.match(r"^(?:\d{1,4}|[ivxlcdm]{1,6})$", clean, re.IGNORECASE):
+            continue
+
+        # Check multi-entry backmatter line (e.g. "Notes 239  References 271  Index 289")
+        multi_hits = list(multi_back_re.finditer(clean))
+        if len(multi_hits) >= 2:
+            pending_prefix = ""
+            for mh in multi_hits:
+                title = _format_toc_title(mh.group(1))
+                pg_pdf = int(mh.group(2)) + arabic_off
+                if toc_end_1based < pg_pdf <= page_count:
+                    entries.append((1, title, pg_pdf))
+            continue
+
+        # Standard line ending in arabic page number: "1  STAPLE BECOMINGS  39"
+        m_ar = re.match(r"^(.+?)(?:\s*\.{2,}\s*|\s+)(\d{1,4})$", clean)
+        if m_ar:
+            raw_title = (f"{pending_prefix} {m_ar.group(1)}" if pending_prefix else m_ar.group(1)).strip()
+            pending_prefix = ""
+            printed_pg = int(m_ar.group(2))
+            pdf_pg = printed_pg + arabic_off
+            title = _format_toc_title(raw_title)
+            # Format leading chapter number cleanly: "1 Staple Becomings" -> "1. Staple Becomings"
+            m_chnum = re.match(r"^(\d{1,2})\s+([A-Za-z].+)$", title)
+            if m_chnum:
+                title = f"{m_chnum.group(1)}. {m_chnum.group(2)}"
+            if len(title) >= 3 and toc_end_1based <= pdf_pg <= page_count:
+                entries.append((1, title, pdf_pg))
+            continue
+
+        # Frontmatter line ending in roman numeral: "Preface ix", "Acknowledgments xvii"
+        m_rom = re.match(r"^(.+?)(?:\s*\.{2,}\s*|\s+)([ivxlcdm]{1,6})$", clean, re.IGNORECASE)
+        if m_rom:
+            rval = _roman_to_int(m_rom.group(2))
+            if rval:
+                raw_title = (f"{pending_prefix} {m_rom.group(1)}" if pending_prefix else m_rom.group(1)).strip()
+                pending_prefix = ""
+                title = _format_toc_title(raw_title)
+                # Use calibrated roman offset, or fall back to matching the title on front pages (1..arabic_off)
+                pdf_pg: Optional[int] = None
+                if roman_off is not None:
+                    cand = rval + roman_off
+                    if 1 <= cand <= page_count:
+                        pdf_pg = cand
+                else:
+                    # Search frontmatter pages (after TOC page, before printed page 1) for this heading
+                    search_end = min(page_count, max(toc_end_1based + 2, arabic_off + 1))
+                    first_word = re.sub(r"[^a-z]", "", (title.split()[0] if title else "").lower())
+                    if len(first_word) >= 4:
+                        for fp_idx in range(toc_end_1based, search_end):
+                            head_txt = (doc[fp_idx].get_text("text") or "")[:300].lower()
+                            if first_word in head_txt:
+                                pdf_pg = fp_idx + 1
+                                # Calibrate roman_off from this match for remaining roman entries!
+                                roman_off = pdf_pg - rval
+                                break
+                if pdf_pg is not None and len(title) >= 3:
+                    entries.append((1, title, pdf_pg))
+                continue
+
+        # Otherwise might be a wrapped title or "Chapter 1" line preceding the next line
+        if len(clean) <= 90 and not re.match(r"^(?:part\s+[ivx\d]+)$", clean, re.IGNORECASE):
+            pending_prefix = f"{pending_prefix} {clean}".strip() if pending_prefix else clean
+        else:
+            pending_prefix = ""
+
+    # Keep monotonically increasing entries by page number
+    mono: List[Tuple[int, str, int]] = []
+    last_pg = 0
+    for lvl, title, pg in entries:
+        if pg > last_pg:
+            mono.append((lvl, title, pg))
+            last_pg = pg
+
+    return mono if len(mono) >= 3 else []
+
+
+def _detect_toc_from_headings(doc: fitz.Document) -> List[Tuple[int, str, int]]:
+    """
+    Tier 3: Visual chapter-opener heading scan when a PDF has neither embedded bookmarks
+    nor a parseable printed Contents page.
+    """
+    page_count = len(doc)
+    if page_count < 20:
+        return []
+
+    # Estimate typical body font size from a sample of interior pages
+    size_counts: Counter = Counter()
+    sample_start = min(15, page_count // 5)
+    for idx in range(sample_start, min(page_count, sample_start + 30)):
+        for b in doc[idx].get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                for sp in ln.get("spans", []):
+                    t = (sp.get("text") or "").strip()
+                    if len(t) >= 4:
+                        size_counts[round(float(sp.get("size") or 10.0), 1)] += len(t)
+    body_sz = size_counts.most_common(1)[0][0] if size_counts else 10.5
+
+    heading_re = re.compile(
+        r"^(?:chapter\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b|"
+        r"preface\b|foreword\b|prologue\b|introduction\b|conclusion\b|epilogue\b|afterword\b|"
+        r"notes\b|endnotes\b|bibliography\b|references\b|works\s+cited\b|index\b)",
+        re.IGNORECASE,
+    )
+
+    entries: List[Tuple[int, str, int]] = []
+    for idx in range(page_count):
+        page = doc[idx]
+        h = page.rect.height
+        top_lines: List[Tuple[float, float, str]] = []
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                _, y0, _, _ = ln["bbox"]
+                if y0 > h * 0.42:
+                    continue
+                spans = [s for s in ln.get("spans", []) if (s.get("text") or "").strip()]
+                if not spans:
+                    continue
+                txt = _clean_line("".join(s.get("text", "") for s in spans))
+                if not txt:
+                    continue
+                max_sz = max(float(s.get("size") or 0.0) for s in spans)
+                top_lines.append((y0, max_sz, txt))
+
+        top_lines.sort(key=lambda r: r[0])
+        for li, (_, sz, txt) in enumerate(top_lines):
+            if sz >= body_sz * 1.25 and heading_re.match(txt) and len(txt) < 110:
+                title = _format_toc_title(txt)
+                if li + 1 < len(top_lines) and top_lines[li + 1][1] >= body_sz * 1.15:
+                    nxt = _format_toc_title(top_lines[li + 1][2])
+                    if nxt and len(nxt) < 90 and not heading_re.match(nxt):
+                        title = f"{title}: {nxt}"
+                entries.append((1, title, idx + 1))
+                break
+
+    return entries if len(entries) >= 3 else []
+
+
 def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: str = "") -> Tuple[dict, List[Tuple[int, str, str]], Optional[bytes]]:
     """
     Parses a PDF into a Folio-compatible manifest, chapter plain-text tuples for FTS5,
     and an optional JPEG cover thumbnail of page 1.
+    Uses a 3-tier TOC strategy:
+      1. Embedded PDF bookmarks (doc.get_toc)
+      2. Printed Table of Contents + automatic folio offset calibration
+      3. Visual chapter-opener headings
     """
     with fitz.open(str(pdf_path)) as doc:
         page_count = len(doc)
         meta = doc.metadata or {}
         raw_title = (meta.get("title") or "").strip()
-        # Ignore unhelpful PDF metadata titles like "Microsoft Word - ..." or bare filenames
         if (
             not raw_title
             or len(raw_title) < 3
@@ -268,23 +615,46 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
         author = (meta.get("author") or "").strip() or fallback_author
         publisher = (meta.get("creator") or meta.get("producer") or "").strip()
 
+        # Tier 1: Embedded PDF bookmarks
         raw_toc = doc.get_toc(simple=True) or []
-        # Filter valid 1-based page numbers
-        valid_toc = [
-            (int(lvl), str(t or "").strip(), max(1, min(page_count, int(pg))))
+        valid_toc: List[Tuple[int, str, int]] = [
+            (int(lvl), _clean_line(str(t or "")), max(1, min(page_count, int(pg))))
             for lvl, t, pg in raw_toc
             if str(t or "").strip() and isinstance(pg, (int, float)) and int(pg) >= 1
         ]
+        toc_source = "bookmarks"
 
-        # Build chapter page ranges from top-level TOC entries if available
+        # Tier 2: Printed Table of Contents + folio offset
+        if len(valid_toc) < 2 and page_count >= 10:
+            printed_toc = _detect_toc_from_printed_contents(doc)
+            if printed_toc:
+                valid_toc = printed_toc
+                toc_source = "printed_toc"
+
+        # Tier 3: Visual chapter-opener headings
+        if len(valid_toc) < 2 and page_count >= 20:
+            heading_toc = _detect_toc_from_headings(doc)
+            if heading_toc:
+                valid_toc = heading_toc
+                toc_source = "headings"
+
+        # Build chapter page ranges from TOC entries if available
         chapters: List[dict] = []
         if len(valid_toc) >= 2 and page_count > 0:
             min_lvl = min(lvl for lvl, _, _ in valid_toc)
-            top_entries = [(t, pg) for lvl, t, pg in valid_toc if lvl == min_lvl]
-            if len(top_entries) < 2:
-                top_entries = [(t, pg) for _, t, pg in valid_toc]
+            lvl1 = [(t, pg) for lvl, t, pg in valid_toc if lvl == min_lvl]
+            lvl2 = [(t, pg) for lvl, t, pg in valid_toc if lvl == min_lvl + 1]
+            # If level 1 is mostly Part wrappers (Part I, Part II) and level 2 has the real chapters, include level 2
+            part_cnt = sum(1 for t, _ in lvl1 if re.match(r"^part\s+[ivx\d]+\b", t, re.IGNORECASE))
+            if part_cnt >= 2 and len(lvl2) >= 3:
+                top_entries = [
+                    (t, pg)
+                    for lvl, t, pg in valid_toc
+                    if lvl == min_lvl + 1 or (lvl == min_lvl and not re.match(r"^part\s+[ivx\d]+\b", t, re.IGNORECASE))
+                ]
+            else:
+                top_entries = lvl1 if len(lvl1) >= 2 else [(t, pg) for _, t, pg in valid_toc]
 
-            # Deduplicate entries starting on the same page
             deduped: List[Tuple[str, int]] = []
             seen_pages = set()
             for t, pg in top_entries:
@@ -312,6 +682,7 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
                     }
                 )
         elif page_count > 0:
+            toc_source = "page_chunks"
             if page_count <= 35:
                 chapters.append(
                     {
@@ -355,7 +726,6 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
             ch["word_count"] = len(joined.split())
             chapter_plain_texts.append((ch["index"], ch["title"], joined))
 
-        # Build TOC list mapped to chapter_index
         def _chapter_for_page(pg: int) -> int:
             for ch in chapters:
                 if ch["start_page"] <= pg <= ch["end_page"]:
@@ -387,7 +757,6 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
                     }
                 )
 
-        # Render cover thumbnail of page 1
         cover_bytes: Optional[bytes] = None
         if page_count > 0:
             try:
@@ -400,6 +769,8 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
 
     manifest = {
         "format": "pdf",
+        "toc_version": PDF_TOC_VERSION,
+        "toc_source": toc_source,
         "title": title,
         "author": author,
         "publisher": publisher,

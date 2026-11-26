@@ -45,6 +45,7 @@ from .db import (
 from .epub import invalidate_epub_cache, parse_epub_from_zip
 from .export import companion_filename_for, format_annotations_markdown
 from .pdf_reader import (
+    PDF_TOC_VERSION,
     classify_pdf_folder,
     clean_pdf_display_title,
     compile_local_chapters_with_booktool,
@@ -582,7 +583,16 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
 
         if is_pdf:
             pdf_file = book_folder / "book.pdf"
-            if not pdf_file.exists() or not book.get("manifest_json"):
+            needs_toc_upgrade = False
+            if book.get("manifest_json"):
+                try:
+                    existing_manifest = json.loads(book["manifest_json"])
+                    if int(existing_manifest.get("toc_version") or 0) < PDF_TOC_VERSION:
+                        needs_toc_upgrade = True
+                except Exception:
+                    needs_toc_upgrade = True
+
+            if not pdf_file.exists() or not book.get("manifest_json") or needs_toc_upgrade:
                 book_folder.mkdir(parents=True, exist_ok=True)
                 if not pdf_file.exists():
                     if has_drive_oauth():
