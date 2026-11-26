@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_mod
 import json
 import os
 import re
@@ -224,6 +225,79 @@ def init_db():
                     [(r["id"], r["book_id"], r["selected_text"] or "", r["note"] or "", r["gemini_response"] or "") for r in ann_rows],
                 )
                 conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('annotations_fts_backfill_v1', '1')")
+
+            # One-time backfill to decode HTML entities (e.g. &#8217;) in cached TOC/chapter titles
+            if not conn.execute("SELECT 1 FROM settings WHERE key = 'html_unescape_toc_v1'").fetchone():
+                def _unescape_str(val: Optional[str]) -> str:
+                    if not val or "&" not in val:
+                        return val or ""
+                    return html_mod.unescape(val)
+
+                book_rows = conn.execute(
+                    "SELECT id, title, author, publisher, last_chapter_title, manifest_json FROM books WHERE manifest_json IS NOT NULL"
+                ).fetchall()
+                for r in book_rows:
+                    try:
+                        manifest = json.loads(r["manifest_json"])
+                    except Exception:
+                        continue
+                    changed = False
+                    for key in ("title", "author", "publisher"):
+                        orig = manifest.get(key)
+                        if isinstance(orig, str) and "&" in orig:
+                            cleaned = _unescape_str(orig)
+                            if cleaned != orig:
+                                manifest[key] = cleaned
+                                changed = True
+                    for ch in manifest.get("chapters") or []:
+                        orig = ch.get("title")
+                        if isinstance(orig, str) and "&" in orig:
+                            cleaned = _unescape_str(orig)
+                            if cleaned != orig:
+                                ch["title"] = cleaned
+                                changed = True
+                                conn.execute(
+                                    "UPDATE chapter_text_fts SET chapter_title = ? WHERE book_id = ? AND chapter_index = ?",
+                                    (cleaned, r["id"], ch.get("index")),
+                                )
+                    for entry in manifest.get("toc") or []:
+                        orig = entry.get("label")
+                        if isinstance(orig, str) and "&" in orig:
+                            cleaned = _unescape_str(orig)
+                            if cleaned != orig:
+                                entry["label"] = cleaned
+                                changed = True
+
+                    new_title = _unescape_str(r["title"])
+                    new_author = _unescape_str(r["author"])
+                    new_pub = _unescape_str(r["publisher"])
+                    new_last_ch = _unescape_str(r["last_chapter_title"])
+                    if (
+                        changed
+                        or new_title != (r["title"] or "")
+                        or new_author != (r["author"] or "")
+                        or new_pub != (r["publisher"] or "")
+                        or new_last_ch != (r["last_chapter_title"] or "")
+                    ):
+                        conn.execute(
+                            """
+                            UPDATE books
+                            SET title = ?, author = ?, publisher = ?, last_chapter_title = ?, manifest_json = ?
+                            WHERE id = ?
+                            """,
+                            (new_title, new_author, new_pub, new_last_ch, json.dumps(manifest), r["id"]),
+                        )
+
+                for tbl in ("annotations", "bookmarks"):
+                    t_rows = conn.execute(
+                        f"SELECT id, chapter_title FROM {tbl} WHERE chapter_title LIKE '%&%;%'"
+                    ).fetchall()
+                    for tr in t_rows:
+                        cleaned = _unescape_str(tr["chapter_title"])
+                        if cleaned != tr["chapter_title"]:
+                            conn.execute(f"UPDATE {tbl} SET chapter_title = ? WHERE id = ?", (cleaned, tr["id"]))
+
+                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('html_unescape_toc_v1', '1')")
 
             # Stamp-gated seed loading
             seed_file = BASE_DIR / "tag_seed.json"

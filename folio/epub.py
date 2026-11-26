@@ -34,6 +34,13 @@ def strip_ns(tag: str) -> str:
     return tag
 
 
+def _clean_text(s: str) -> str:
+    """Decode HTML entities and collapse whitespace in extracted metadata/TOC strings."""
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", html_mod.unescape(s)).strip()
+
+
 def extract_plain_text_from_xhtml(raw_bytes: bytes) -> str:
     try:
         text = raw_bytes.decode("utf-8", errors="replace")
@@ -215,7 +222,7 @@ def parse_epub_from_zip(epub_path: Path) -> Tuple[dict, List[Tuple[int, str, str
             if cname == "metadata":
                 for m in child:
                     mname = strip_ns(m.tag)
-                    text_val = (m.text or "").strip()
+                    text_val = _clean_text(m.text or "")
                     if mname == "title" and text_val:
                         if not title:
                             title = text_val
@@ -288,7 +295,7 @@ def parse_epub_from_zip(epub_path: Path) -> Tuple[dict, List[Tuple[int, str, str
                                 for a_el in nav_el.iter():
                                     if strip_ns(a_el.tag) == "a" and a_el.attrib.get("href"):
                                         raw_href = a_el.attrib["href"]
-                                        label = re.sub(r"\s+", " ", "".join(a_el.itertext()).strip())
+                                        label = _clean_text("".join(a_el.itertext()))
                                         base_part = urllib.parse.unquote(raw_href.split("#")[0])
                                         frag = raw_href.split("#")[1] if "#" in raw_href else ""
                                         resolved = (
@@ -318,7 +325,7 @@ def parse_epub_from_zip(epub_path: Path) -> Tuple[dict, List[Tuple[int, str, str
                             for sub in np:
                                 sname = strip_ns(sub.tag)
                                 if sname == "navLabel":
-                                    label = re.sub(r"\s+", " ", "".join(sub.itertext()).strip())
+                                    label = _clean_text("".join(sub.itertext()))
                                 elif sname == "content":
                                     src = sub.attrib.get("src", "")
                             if label and src:
@@ -349,13 +356,13 @@ def parse_epub_from_zip(epub_path: Path) -> Tuple[dict, List[Tuple[int, str, str
                         txt_html = raw_bytes.decode("utf-8", errors="replace")
                         m_h = re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", txt_html, flags=re.DOTALL | re.IGNORECASE)
                         if m_h:
-                            t_cand = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m_h.group(1)).strip())
+                            t_cand = _clean_text(re.sub(r"<[^>]+>", "", m_h.group(1)))
                             if t_cand:
                                 ch_title = t_cand
                         if not ch_title:
                             m_t = re.search(r"<title[^>]*>(.*?)</title>", txt_html, flags=re.DOTALL | re.IGNORECASE)
                             if m_t:
-                                t_cand = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m_t.group(1)).strip())
+                                t_cand = _clean_text(re.sub(r"<[^>]+>", "", m_t.group(1)))
                                 if t_cand:
                                     ch_title = t_cand
                     except Exception:
