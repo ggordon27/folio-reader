@@ -198,6 +198,12 @@
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       await page.render({ canvasContext: ctx, viewport }).promise;
 
+      const hlLayerDiv = document.createElement("div");
+      hlLayerDiv.className = "pdf-highlight-layer";
+      hlLayerDiv.style.width = `${viewport.width}px`;
+      hlLayerDiv.style.height = `${viewport.height}px`;
+      slot.appendChild(hlLayerDiv);
+
       const textLayerDiv = document.createElement("div");
       textLayerDiv.className = "textLayer";
       textLayerDiv.style.width = `${viewport.width}px`;
@@ -220,7 +226,7 @@
       slot.appendChild(badge);
 
       pdfState.renderedPages.add(pageNum);
-      _applyHighlightsToPage(pageNum, textLayerDiv);
+      _applyHighlightsToPage(pageNum, slot, textLayerDiv, hlLayerDiv);
     } catch (err) {
       console.warn(`PDF page ${pageNum} render error:`, err);
     } finally {
@@ -228,21 +234,35 @@
     }
   }
 
-  function _normalizeForMatch(s) {
-    return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  function _buildCompactTextIndex(rootEl) {
+    // Maps every non-whitespace character in textLayer text nodes to (node, offset)
+    // so PDF kerning spaces (e.g. "anx i eties") never break character-exact matching.
+    const chars = [];
+    const nodes = [];
+    const offsets = [];
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+      const val = node.nodeValue || "";
+      for (let i = 0; i < val.length; i++) {
+        const ch = val[i];
+        if (!/\s/.test(ch)) {
+          chars.push(ch.toLowerCase());
+          nodes.push(node);
+          offsets.push(i);
+        }
+      }
+    }
+    return { compact: chars.join(""), nodes, offsets };
   }
 
-  function _applyHighlightsToPage(pageNum, textLayerDiv) {
-    if (!textLayerDiv) return;
+  function _applyHighlightsToPage(pageNum, slot, textLayerDiv, hlLayerDiv) {
+    if (!slot || !textLayerDiv || !hlLayerDiv) return;
+    hlLayerDiv.innerHTML = "";
+
     const getAnnotations = pdfState.callbacks.getAnnotations;
     const anns = typeof getAnnotations === "function" ? getAnnotations() : [];
     const pageTag = `p. ${pageNum}`;
-
-    // Clear previous highlight classes
-    textLayerDiv.querySelectorAll("span.folio-pdf-hl").forEach((sp) => {
-      sp.classList.remove("folio-pdf-hl", "hl-blue", "hl-yellow", "hl-red", "hl-green", "hl-grey");
-      sp.removeAttribute("data-ann-id");
-    });
 
     const pageAnns = anns.filter((a) => {
       const pn = (a.page_number || "").trim().toLowerCase();
@@ -250,36 +270,59 @@
     });
     if (!pageAnns.length) return;
 
-    const spans = Array.from(textLayerDiv.querySelectorAll("span"));
-    if (!spans.length) return;
+    const index = _buildCompactTextIndex(textLayerDiv);
+    if (!index.compact.length) return;
 
-    // Build concatenated normalized text with span index map
-    let fullText = "";
-    const spanRanges = [];
-    for (const sp of spans) {
-      const t = _normalizeForMatch(sp.textContent);
-      if (!t) continue;
-      if (fullText.length > 0) fullText += " ";
-      const start = fullText.length;
-      fullText += t;
-      spanRanges.push({ sp, start, end: fullText.length });
-    }
+    const slotRect = slot.getBoundingClientRect();
+    if (!slotRect.width || !slotRect.height) return;
 
     for (const ann of pageAnns) {
-      const needle = _normalizeForMatch(ann.selected_text || "");
-      if (needle.length < 3) continue;
-      let idx = fullText.indexOf(needle);
-      if (idx === -1 && needle.length > 36) {
-        idx = fullText.indexOf(needle.slice(0, 36));
-      }
-      if (idx === -1) continue;
-      const endIdx = idx + Math.min(needle.length, fullText.length - idx);
-      const color = (ann.color || "yellow").toLowerCase();
-      for (const sr of spanRanges) {
-        if (sr.end > idx && sr.start < endIdx) {
-          sr.sp.classList.add("folio-pdf-hl", `hl-${color}`);
-          sr.sp.dataset.annId = ann.id;
+      const needle = (ann.selected_text || "").replace(/\s+/g, "").toLowerCase();
+      if (needle.length < 2) continue;
+
+      let startIdx = index.compact.indexOf(needle);
+      let matchLen = needle.length;
+      if (startIdx === -1 && needle.length > 32) {
+        // Fallback: anchor on start + end chunks
+        const head = needle.slice(0, 28);
+        const tail = needle.slice(-24);
+        const hIdx = index.compact.indexOf(head);
+        if (hIdx !== -1) {
+          startIdx = hIdx;
+          const tIdx = index.compact.indexOf(tail, hIdx + head.length);
+          matchLen = tIdx !== -1 && tIdx - hIdx < needle.length * 1.4
+            ? (tIdx + tail.length) - hIdx
+            : Math.min(needle.length, index.compact.length - hIdx);
         }
+      }
+      if (startIdx === -1) continue;
+
+      const endCharIdx = Math.min(index.compact.length - 1, startIdx + matchLen - 1);
+      const startNode = index.nodes[startIdx];
+      const startOff = index.offsets[startIdx];
+      const endNode = index.nodes[endCharIdx];
+      const endOff = index.offsets[endCharIdx] + 1;
+
+      try {
+        const range = document.createRange();
+        range.setStart(startNode, startOff);
+        range.setEnd(endNode, Math.min(endOff, (endNode.nodeValue || "").length));
+        const rects = Array.from(range.getClientRects());
+        const color = (ann.color || "yellow").toLowerCase();
+
+        for (const r of rects) {
+          if (r.width < 1 || r.height < 1) continue;
+          const box = document.createElement("div");
+          box.className = `pdf-hl-rect hl-${color}`;
+          box.dataset.annId = ann.id;
+          box.style.left = `${r.left - slotRect.left}px`;
+          box.style.top = `${r.top - slotRect.top}px`;
+          box.style.width = `${r.width}px`;
+          box.style.height = `${r.height}px`;
+          hlLayerDiv.appendChild(box);
+        }
+      } catch (err) {
+        console.warn("PDF highlight range error:", err);
       }
     }
   }
@@ -290,7 +333,8 @@
     for (const pno of pdfState.renderedPages) {
       const slot = wrap.querySelector(`.pdf-page-slot[data-page-number="${pno}"]`);
       const tl = slot?.querySelector(".textLayer");
-      if (tl) _applyHighlightsToPage(pno, tl);
+      const hl = slot?.querySelector(".pdf-highlight-layer");
+      if (slot && tl && hl) _applyHighlightsToPage(pno, slot, tl, hl);
     }
   }
 

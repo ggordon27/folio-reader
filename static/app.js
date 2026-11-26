@@ -2081,6 +2081,10 @@ function findNthOccurrence(haystack, needle, occurrenceIndex = 0) {
 }
 
 function applySavedHighlightsToIframe() {
+  if (isActiveBookPdf()) {
+    window.FolioPdfViewer?.refreshHighlights();
+    return;
+  }
   const doc = el.epubFrame.contentDocument;
   if (!doc || !doc.body || !state.activeBook) return;
 

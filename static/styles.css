@@ -2485,12 +2485,47 @@ body.focus-mode .exit-focus-btn {
   display: block;
 }
 
+.pdf-highlight-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.pdf-hl-rect {
+  position: absolute;
+  border-radius: 2px;
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+
+[data-theme="dark"] .pdf-hl-rect {
+  mix-blend-mode: screen;
+}
+
+.pdf-hl-rect.hl-blue {
+  background: rgba(59, 130, 246, 0.28);
+}
+.pdf-hl-rect.hl-yellow {
+  background: rgba(250, 204, 21, 0.36);
+}
+.pdf-hl-rect.hl-red {
+  background: rgba(239, 68, 68, 0.28);
+}
+.pdf-hl-rect.hl-green {
+  background: rgba(34, 197, 94, 0.28);
+}
+.pdf-hl-rect.hl-grey {
+  background: rgba(107, 114, 128, 0.28);
+}
+
 .pdf-page-slot .textLayer {
   position: absolute;
   inset: 0;
   opacity: 1;
   line-height: 1;
   pointer-events: auto;
+  z-index: 2;
 }
 
 .pdf-page-slot .textLayer span {
