@@ -68,7 +68,7 @@ async def lifespan(_app: FastAPI):
     init_db()
     start_periodic_drive_sync()
     if has_drive_oauth():
-        start_background_metadata_enrichment(limit=5000)
+        start_background_metadata_enrichment(limit=300)
     print(f"Folio data directory: {DATA_DIR}", flush=True)
     yield
 
@@ -87,14 +87,14 @@ _PUBLIC_PATHS = {
 @app.middleware("http")
 async def auth_and_error_middleware(request: Request, call_next):
     path = request.url.path
-    if (path.startswith("/api/") or path.startswith("/epub/") or path.startswith("/pdf/")) and path not in _PUBLIC_PATHS:
-        if not is_request_authenticated(request):
-            return JSONResponse(
-                {"error": "Authentication required", "code": "AUTH_REQUIRED"},
-                status_code=401,
-                headers={"Cache-Control": "no-store"},
-            )
     try:
+        if (path.startswith("/api/") or path.startswith("/epub/") or path.startswith("/pdf/")) and path not in _PUBLIC_PATHS:
+            if not is_request_authenticated(request):
+                return JSONResponse(
+                    {"error": "Authentication required", "code": "AUTH_REQUIRED"},
+                    status_code=401,
+                    headers={"Cache-Control": "no-store"},
+                )
         return await call_next(request)
     except Exception as exc:
         traceback.print_exc()

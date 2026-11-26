@@ -1063,13 +1063,18 @@ def sync_library_from_drive(allow_cache_fallback: bool = True) -> list:
 
 
 def save_cover_thumbnail(book_id: str, cover_bytes: bytes, cover_href: str) -> bool:
-    """Saves cover image bytes to DATA_DIR/covers/<book_id>.<ext> (capped at 1.5 MB)."""
+    """Saves cover image bytes to DATA_DIR/covers/<book_id>.<ext> (capped at 1.5 MB, with disk guard)."""
     if not cover_bytes or len(cover_bytes) > 1_500_000:
         return False
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if shutil.disk_usage(DATA_DIR).free < 250 * 1024 * 1024:
+            return False
+    except OSError:
+        pass
     ext = Path(cover_href).suffix.lower()
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
         ext = ".jpg"
-    COVERS_DIR.mkdir(parents=True, exist_ok=True)
     # Remove any previous cover with a different extension
     for old in COVERS_DIR.glob(f"{book_id}.*"):
         try:
@@ -1413,8 +1418,16 @@ def start_background_metadata_enrichment(limit: int = 5000, format_filter: str =
                 return
             stats["total"] = len(book_items)
             print(f"Metadata enrichment starting for {len(book_items)} books...", flush=True)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                 list(pool.map(_enrich_one, book_items))
+            try:
+                conn_ck = get_db()
+                try:
+                    conn_ck.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finally:
+                    conn_ck.close()
+            except Exception:
+                pass
         finally:
             with _META_ENRICH_LOCK:
                 _META_ENRICH_RUNNING = False
@@ -2096,7 +2109,7 @@ def sync_pdfs_from_drive() -> dict:
     finally:
         conn.close()
 
-    start_background_metadata_enrichment(limit=5000, format_filter="pdf")
+    start_background_metadata_enrichment(limit=400, format_filter="pdf")
 
     return {
         "ok": True,

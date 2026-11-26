@@ -448,14 +448,14 @@ def extract_pdf_metadata_and_cover(
         final_author = _clean_line(final_author)
         final_pub = _clean_line(final_pub)
 
-        # Render cover thumbnail
+        # Render compact cover thumbnail (~10-18 KB)
         cover_bytes: Optional[bytes] = None
         if page_count > 0:
             try:
                 pg = doc[min(cover_page_idx, page_count - 1)]
-                scale = min(1.5, 420.0 / max(pg.rect.width, 1.0))
+                scale = min(1.2, 280.0 / max(pg.rect.width, 1.0))
                 pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-                cover_bytes = pix.tobytes("jpeg", jpg_quality=82)
+                cover_bytes = pix.tobytes("jpeg", jpg_quality=72)
             except Exception:
                 cover_bytes = None
 
