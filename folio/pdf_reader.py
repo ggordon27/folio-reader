@@ -9,12 +9,14 @@ import shutil
 import statistics
 import sys
 import tempfile
+import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+import httpx
 
 from .config import (
     BOOKS_DIR,
@@ -232,13 +234,244 @@ def clean_pdf_display_title(filename: str, folder_name: str = "") -> Tuple[str, 
     return clean or folder_name or filename, ""
 
 
+_DOI_RE = re.compile(r"\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)")
+_JUNK_PDF_TITLE_RE = re.compile(
+    r"^(?:microsoft\s+word|untitled|adobe|cambridge\s+core|project\s+muse|jstor|doi:|http|p\d+|ch\d+|full\s+text|index)",
+    re.IGNORECASE,
+)
+_COVER_SHEET_RE = re.compile(
+    r"(?:project\s+muse|downloaded\s+from\s+https?://|jstor\.org|cambridge\.org/core|terms\s+of\s+use|access\s+provided\s+by)",
+    re.IGNORECASE,
+)
+
+
+def _is_usable_title(t: str) -> bool:
+    s = _clean_line(t)
+    if len(s) < 3 or len(s) > 260:
+        return False
+    if s.lower().endswith(".pdf") or _JUNK_PDF_TITLE_RE.match(s):
+        return False
+    return True
+
+
+def _lookup_crossref_doi(doi: str) -> Tuple[str, str, str]:
+    """Queries CrossRef REST API for authoritative (title, author, publisher) from a DOI."""
+    clean_doi = doi.rstrip(".,;:) ]")
+    url = f"https://api.crossref.org/works/{urllib.parse.quote(clean_doi, safe='')}"
+    try:
+        with httpx.Client(timeout=8.0, headers={"User-Agent": "FolioReader/1.0 (mailto:folio@local)"}) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return "", "", ""
+            msg = (resp.json() or {}).get("message") or {}
+    except Exception:
+        return "", "", ""
+
+    titles = msg.get("title") or []
+    subtitles = msg.get("subtitle") or []
+    main_t = _clean_line(titles[0]) if titles else ""
+    sub_t = _clean_line(subtitles[0]) if subtitles else ""
+    full_title = (
+        f"{main_t}: {sub_t}"
+        if (main_t and sub_t and sub_t.lower() not in main_t.lower())
+        else main_t
+    )
+
+    authors: List[str] = []
+    for a in (msg.get("author") or msg.get("editor") or [])[:5]:
+        given = (a.get("given") or "").strip()
+        family = (a.get("family") or "").strip()
+        full = f"{given} {family}".strip() if (given or family) else (a.get("name") or "").strip()
+        if full:
+            authors.append(full)
+    author_str = ", ".join(authors)
+
+    container = msg.get("container-title") or []
+    publisher = _clean_line(container[0]) if container else _clean_line(msg.get("publisher") or "")
+    return full_title, author_str, publisher
+
+
+def _extract_loc_cip_metadata(front_texts: List[str]) -> Tuple[str, str, str]:
+    """Extracts (title, author, publisher) from Library of Congress CIP / copyright page."""
+    title = ""
+    author = ""
+    publisher = ""
+    for txt in front_texts:
+        flat = _clean_line(txt)
+        # "Title: Staple security : bread and wheat in Egypt / Jessica Barnes."
+        m_loc = re.search(
+            r"Title:\s*(.+?)\.\s+(?:Other\s+titles|Description|Identifiers|Subjects|Classification|LC\s+record):",
+            flat,
+        )
+        if not m_loc:
+            m_loc = re.search(r"Title:\s*([^/]+/\s*[^.]{2,120})\.", flat)
+        if m_loc and "/" in m_loc.group(1):
+            t_part, a_part = m_loc.group(1).rsplit("/", 1)
+            t_part = re.sub(r"\s*:\s*", ": ", t_part.strip())
+            a_part = re.sub(r"^(?:by|edited\s+by)\s+", "", a_part.strip(), flags=re.IGNORECASE).strip(" ,.;")
+            if _is_usable_title(t_part):
+                title = _format_toc_title(t_part) if t_part.isupper() else t_part
+            if a_part and len(a_part) <= 120:
+                author = a_part
+
+        if not author:
+            m_names = re.search(r"Names:\s*([A-Z][^,.;]+,\s*[A-Z][^,.;]+?)(?:,\s*(?:19|20)\d{2}|,\s*author|,\s*editor|\.)", flat)
+            if m_names:
+                parts = [p.strip() for p in m_names.group(1).split(",", 1)]
+                if len(parts) == 2 and parts[1]:
+                    author = f"{parts[1]} {parts[0]}".strip()
+
+        if not publisher:
+            m_pub = re.search(
+                r"(?:Published\s+by|©\s*(?:19|20)\d{2}\s+(?:by\s+)?)\s*([A-Z][A-Za-z0-9&'\s\-]{3,70}?(?:Press|Books|Publishing|Publishers|Routledge|Verso|Palgrave|Springer|Brill|De\s+Gruyter|Sage|Wiley|Polity|Pluto|Haymarket|Zed))",
+                flat,
+            )
+            if m_pub:
+                publisher = _clean_line(m_pub.group(1))
+        if title and author:
+            break
+    return title, author, publisher
+
+
+def _extract_title_page_heuristic(doc: fitz.Document, start_idx: int = 0) -> Tuple[str, str]:
+    """Extracts (title, author) from the largest typography on the first non-cover-sheet pages."""
+    best_title = ""
+    best_author = ""
+    end_idx = min(len(doc), start_idx + 4)
+    for idx in range(start_idx, end_idx):
+        page = doc[idx]
+        txt = page.get_text("text") or ""
+        if _COVER_SHEET_RE.search(txt[:800]) or len(txt.strip()) < 15:
+            continue
+        lines_meta: List[Tuple[float, str]] = []
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                spans = [s for s in ln.get("spans", []) if (s.get("text") or "").strip()]
+                if not spans:
+                    continue
+                line_txt = _clean_line("".join(s.get("text", "") for s in spans))
+                if not line_txt or len(line_txt) > 160:
+                    continue
+                max_sz = max(float(s.get("size") or 0.0) for s in spans)
+                lines_meta.append((max_sz, line_txt))
+        if not lines_meta:
+            continue
+        max_font = max(sz for sz, _ in lines_meta)
+        if max_font < 13.0:
+            continue
+        title_lines = [t for sz, t in lines_meta if sz >= max_font - 1.5 and not re.match(r"^(?:part|chapter)\b", t, re.I)]
+        cand_title = _clean_line(" ".join(title_lines[:3]))
+        if _is_usable_title(cand_title):
+            best_title = _format_toc_title(cand_title) if cand_title.isupper() else cand_title
+            # Look for an author line (smaller than title, >= 10pt, 2-5 capitalized words)
+            for sz, t in lines_meta:
+                if sz < max_font - 1.5 and sz >= 10.0 and t not in title_lines:
+                    if re.match(r"^(?:by\s+)?[A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z\-]+(?:\s+(?:and|&)\s+[A-Z][a-z]+\s+[A-Z][a-z\-]+)?$", t):
+                        best_author = re.sub(r"^by\s+", "", t, flags=re.IGNORECASE).strip()
+                        break
+            break
+    return best_title, best_author
+
+
+def extract_pdf_metadata_and_cover(
+    pdf_path: Path,
+    fallback_title: str = "",
+    fallback_author: str = "",
+    allow_crossref: bool = True,
+) -> Tuple[str, str, str, int, Optional[bytes]]:
+    """
+    Extracts authoritative (title, author, publisher, page_count, cover_bytes) from a PDF using:
+      1. Embedded PDF metadata (filtered for junk)
+      2. Library of Congress CIP / copyright page
+      3. DOI lookup via CrossRef API (great for journal articles & Cambridge Core / MUSE)
+      4. Title-page font-size heuristic
+    Also renders a clean cover thumbnail (skipping generic Project MUSE / JSTOR cover sheets).
+    """
+    with fitz.open(str(pdf_path)) as doc:
+        page_count = len(doc)
+        meta = doc.metadata or {}
+        meta_title = (meta.get("title") or "").strip()
+        meta_author = (meta.get("author") or "").strip()
+        meta_pub = ""
+        for k in ("publisher", "subject"):
+            v = (meta.get(k) or "").strip()
+            if v and len(v) < 80 and not v.lower().startswith(("http", "doi:")):
+                meta_pub = v
+                break
+
+        front_limit = min(page_count, 8)
+        front_texts = [(doc[i].get_text("text") or "") for i in range(front_limit)]
+
+        # Detect if page 1 is a Project MUSE / JSTOR / Cambridge download cover sheet
+        cover_page_idx = 0
+        if page_count >= 2 and _COVER_SHEET_RE.search(front_texts[0][:1000]):
+            cover_page_idx = 1
+
+        # 1. Try Library of Congress CIP / copyright page
+        cip_title, cip_author, cip_pub = _extract_loc_cip_metadata(front_texts)
+
+        # 2. Try DOI lookup via CrossRef (first 3 pages + PDF metadata)
+        cr_title = cr_author = cr_pub = ""
+        if allow_crossref:
+            doi_match = None
+            for blob in [meta.get("subject") or "", meta.get("keywords") or ""] + front_texts[:3]:
+                m = _DOI_RE.search(blob)
+                if m:
+                    doi_match = m.group(1)
+                    break
+            if doi_match:
+                cr_title, cr_author, cr_pub = _lookup_crossref_doi(doi_match)
+
+        # 3. Title-page typography heuristic if still missing title/author
+        tp_title = tp_author = ""
+        if not (cr_title or cip_title or _is_usable_title(meta_title)):
+            tp_title, tp_author = _extract_title_page_heuristic(doc, start_idx=cover_page_idx)
+        elif not (cr_author or cip_author or meta_author):
+            _, tp_author = _extract_title_page_heuristic(doc, start_idx=cover_page_idx)
+
+        # Combine in priority order: CrossRef (exact for articles/DOIs) -> CIP (exact for books) -> PDF meta -> Title page -> fallback
+        final_title = (
+            cr_title
+            or cip_title
+            or (meta_title if _is_usable_title(meta_title) else "")
+            or tp_title
+            or fallback_title
+            or pdf_path.stem
+        )
+        final_author = cr_author or cip_author or meta_author or tp_author or fallback_author
+        final_pub = cr_pub or cip_pub or meta_pub
+
+        # Clean up stray author/title whitespace
+        final_title = _clean_line(final_title)
+        final_author = _clean_line(final_author)
+        final_pub = _clean_line(final_pub)
+
+        # Render cover thumbnail
+        cover_bytes: Optional[bytes] = None
+        if page_count > 0:
+            try:
+                pg = doc[min(cover_page_idx, page_count - 1)]
+                scale = min(1.5, 420.0 / max(pg.rect.width, 1.0))
+                pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                cover_bytes = pix.tobytes("jpeg", jpg_quality=82)
+            except Exception:
+                cover_bytes = None
+
+    return final_title, final_author, final_pub, page_count, cover_bytes
+
+
 def render_pdf_cover(pdf_path: Path, max_width: int = 420) -> Optional[bytes]:
-    """Renders page 1 of a PDF to a JPEG thumbnail."""
+    """Renders cover page of a PDF to a JPEG thumbnail (skipping download cover sheets)."""
     try:
         with fitz.open(str(pdf_path)) as doc:
             if len(doc) == 0:
                 return None
-            page = doc[0]
+            idx = 0
+            if len(doc) >= 2 and _COVER_SHEET_RE.search((doc[0].get_text("text") or "")[:1000]):
+                idx = 1
+            page = doc[idx]
             rect = page.rect
             scale = min(1.5, max_width / max(rect.width, 1.0))
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
@@ -593,27 +826,18 @@ def _detect_toc_from_headings(doc: fitz.Document) -> List[Tuple[int, str, int]]:
 def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: str = "") -> Tuple[dict, List[Tuple[int, str, str]], Optional[bytes]]:
     """
     Parses a PDF into a Folio-compatible manifest, chapter plain-text tuples for FTS5,
-    and an optional JPEG cover thumbnail of page 1.
+    and an optional JPEG cover thumbnail.
     Uses a 3-tier TOC strategy:
       1. Embedded PDF bookmarks (doc.get_toc)
       2. Printed Table of Contents + automatic folio offset calibration
       3. Visual chapter-opener headings
     """
+    title, author, publisher, _, cover_bytes = extract_pdf_metadata_and_cover(
+        pdf_path, fallback_title=fallback_title, fallback_author=fallback_author, allow_crossref=True
+    )
+
     with fitz.open(str(pdf_path)) as doc:
         page_count = len(doc)
-        meta = doc.metadata or {}
-        raw_title = (meta.get("title") or "").strip()
-        if (
-            not raw_title
-            or len(raw_title) < 3
-            or raw_title.lower().endswith(".pdf")
-            or raw_title.lower().startswith(("microsoft word", "untitled", "adobe", "cambridge", "doi:"))
-        ):
-            title = fallback_title or pdf_path.stem
-        else:
-            title = raw_title
-        author = (meta.get("author") or "").strip() or fallback_author
-        publisher = (meta.get("creator") or meta.get("producer") or "").strip()
 
         # Tier 1: Embedded PDF bookmarks
         raw_toc = doc.get_toc(simple=True) or []
@@ -756,16 +980,6 @@ def parse_pdf_file(pdf_path: Path, fallback_title: str = "", fallback_author: st
                         "chapter_index": ch["index"],
                     }
                 )
-
-        cover_bytes: Optional[bytes] = None
-        if page_count > 0:
-            try:
-                page0 = doc[0]
-                scale = min(1.5, 420.0 / max(page0.rect.width, 1.0))
-                pix = page0.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-                cover_bytes = pix.tobytes("jpeg", jpg_quality=82)
-            except Exception:
-                cover_bytes = None
 
     manifest = {
         "format": "pdf",

@@ -49,6 +49,7 @@ from .pdf_reader import (
     classify_pdf_folder,
     clean_pdf_display_title,
     compile_local_chapters_with_booktool,
+    extract_pdf_metadata_and_cover,
     parse_pdf_file,
 )
 
@@ -1264,8 +1265,12 @@ def extract_remote_opf_and_cover(file_id: str, known_size: int = 0) -> Tuple[str
             return _extract_opf_and_cover_from_zip(zf)
 
 
-def start_background_metadata_enrichment(limit: int = 5000):
-    """Extracts true OPF title/author/publisher and cover thumbnails via HTTP Range requests without downloading full EPUBs."""
+def start_background_metadata_enrichment(limit: int = 5000, format_filter: str = ""):
+    """
+    Extracts true title/author/publisher and cover thumbnails in the background:
+    - EPUBs: HTTP Range ZIP OPF extraction (>98% less bandwidth)
+    - PDFs: PyMuPDF + Library of Congress CIP + CrossRef DOI lookup + cover thumbnail
+    """
     global _META_ENRICH_RUNNING
     with _META_ENRICH_LOCK:
         if _META_ENRICH_RUNNING:
@@ -1275,32 +1280,60 @@ def start_background_metadata_enrichment(limit: int = 5000):
     _db_write_lock = threading.Lock()
     stats = {"done": 0, "ok": 0, "err": 0, "total": 0}
 
-    def _enrich_one(item: Tuple[str, int]):
-        bid, known_size = item
+    def _enrich_one(item: Tuple[str, int, str, str, str]):
+        bid, known_size, fmt, cur_title, cur_author = item
+        is_pdf = (fmt or "epub").lower() == "pdf"
         local_epub = BOOKS_DIR / bid / "book.epub"
+        local_pdf = BOOKS_DIR / bid / "book.pdf"
         tmp_epub = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.epub"
+        tmp_pdf = Path(tempfile.gettempdir()) / f"sync_meta_{bid}.pdf"
         try:
             t_val = a_val = p_val = cover_href = ""
             cover_bytes = None
-            if local_epub.exists():
-                with zipfile.ZipFile(local_epub, "r") as zf:
-                    t_val, a_val, p_val, cover_bytes, cover_href = _extract_opf_and_cover_from_zip(zf)
-            elif has_drive_oauth():
-                try:
-                    t_val, a_val, p_val, cover_bytes, cover_href = extract_remote_opf_and_cover(bid, known_size)
-                except Exception:
-                    # Fallback to full download only if Range request fails on a non-standard zip
-                    drive_rest_download(bid, tmp_epub)
-                    if tmp_epub.exists():
+            page_count = 0
+
+            if is_pdf:
+                pdf_src: Optional[Path] = None
+                if local_pdf.exists():
+                    pdf_src = local_pdf
+                elif has_drive_oauth():
+                    drive_rest_download(bid, tmp_pdf)
+                    if tmp_pdf.exists():
+                        pdf_src = tmp_pdf
+                elif os.path.exists(GDRIVE_BIN):
+                    dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_pdf)], timeout=60)
+                    if dl_p.returncode == 0 and tmp_pdf.exists():
+                        pdf_src = tmp_pdf
+                else:
+                    return
+                if not pdf_src:
+                    return
+                t_val, a_val, p_val, page_count, cover_bytes = extract_pdf_metadata_and_cover(
+                    pdf_src,
+                    fallback_title=cur_title,
+                    fallback_author=cur_author,
+                    allow_crossref=True,
+                )
+                cover_href = "cover.jpg" if cover_bytes else ""
+            else:
+                if local_epub.exists():
+                    with zipfile.ZipFile(local_epub, "r") as zf:
+                        t_val, a_val, p_val, cover_bytes, cover_href = _extract_opf_and_cover_from_zip(zf)
+                elif has_drive_oauth():
+                    try:
+                        t_val, a_val, p_val, cover_bytes, cover_href = extract_remote_opf_and_cover(bid, known_size)
+                    except Exception:
+                        drive_rest_download(bid, tmp_epub)
+                        if tmp_epub.exists():
+                            with zipfile.ZipFile(tmp_epub, "r") as zf:
+                                t_val, a_val, p_val, cover_bytes, cover_href = _extract_opf_and_cover_from_zip(zf)
+                elif os.path.exists(GDRIVE_BIN):
+                    dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
+                    if dl_p.returncode == 0 and tmp_epub.exists():
                         with zipfile.ZipFile(tmp_epub, "r") as zf:
                             t_val, a_val, p_val, cover_bytes, cover_href = _extract_opf_and_cover_from_zip(zf)
-            elif os.path.exists(GDRIVE_BIN):
-                dl_p = run_gdrive(["readonly", "download", bid, "--out", str(tmp_epub)], timeout=30)
-                if dl_p.returncode == 0 and tmp_epub.exists():
-                    with zipfile.ZipFile(tmp_epub, "r") as zf:
-                        t_val, a_val, p_val, cover_bytes, cover_href = _extract_opf_and_cover_from_zip(zf)
-            else:
-                return
+                else:
+                    return
 
             saved_cover = 1 if (cover_bytes and save_cover_thumbnail(bid, cover_bytes, cover_href)) else 0
             with _db_write_lock:
@@ -1314,52 +1347,73 @@ def start_background_metadata_enrichment(limit: int = 5000):
                                 author = COALESCE(NULLIF(?, ''), author),
                                 publisher = COALESCE(NULLIF(?, ''), publisher),
                                 cover_href = COALESCE(NULLIF(?, ''), cover_href),
+                                page_count = CASE WHEN ? > 0 THEN ? ELSE COALESCE(page_count, 0) END,
                                 has_cover = CASE WHEN ? = 1 THEN 1 ELSE COALESCE(has_cover, 0) END,
                                 meta_verified = 1
                             WHERE id = ?
                             """,
-                            (t_val, a_val, p_val, cover_href, saved_cover, bid),
+                            (t_val, a_val, p_val, cover_href, page_count, page_count, saved_cover, bid),
                         )
                 finally:
                     conn_w.close()
                 stats["ok"] += 1
-                if stats["ok"] <= 5:
-                    print(f"OPF updated: {t_val} — {a_val} ({p_val})", flush=True)
+                if stats["ok"] <= 8:
+                    print(f"Meta updated ({fmt}): {t_val} — {a_val} ({p_val})", flush=True)
         except Exception as exc:
             with _db_write_lock:
                 stats["err"] += 1
-                if stats["err"] <= 5:
-                    print(f"OPF enrich error ({bid}): {exc}", flush=True)
+                if stats["err"] <= 8:
+                    print(f"Meta enrich error ({fmt} {bid}): {exc}", flush=True)
         finally:
             with _db_write_lock:
                 stats["done"] += 1
-                if stats["done"] % 50 == 0 or stats["done"] == stats["total"]:
-                    print(f"OPF enrichment: {stats['done']}/{stats['total']} (updated {stats['ok']}, errors {stats['err']})", flush=True)
-            try:
-                if tmp_epub.exists():
-                    tmp_epub.unlink()
-            except Exception:
-                pass
+                if stats["done"] % 25 == 0 or stats["done"] == stats["total"]:
+                    print(f"Metadata enrichment: {stats['done']}/{stats['total']} (updated {stats['ok']}, errors {stats['err']})", flush=True)
+            for tmp_f in (tmp_epub, tmp_pdf):
+                try:
+                    if tmp_f.exists():
+                        tmp_f.unlink()
+                except Exception:
+                    pass
 
     def _worker():
         global _META_ENRICH_RUNNING
         try:
             conn = get_db()
             try:
+                where_fmt = ""
+                params: list = []
+                if format_filter in ("epub", "pdf"):
+                    where_fmt = "AND COALESCE(format, 'epub') = ?"
+                    params.append(format_filter)
+                params.append(limit)
                 rows = conn.execute(
-                    "SELECT id, COALESCE(size, 0) AS size FROM books WHERE COALESCE(meta_verified, 0) = 0 OR publisher IS NULL OR publisher = '' ORDER BY downloaded DESC, modified_time DESC LIMIT ?",
-                    (limit,),
+                    f"""
+                    SELECT id, COALESCE(size, 0) AS size, COALESCE(format, 'epub') AS format,
+                           COALESCE(title, '') AS title, COALESCE(author, '') AS author
+                    FROM books
+                    WHERE (COALESCE(meta_verified, 0) = 0 OR publisher IS NULL OR publisher = ''
+                           OR (COALESCE(format, 'epub') = 'pdf' AND (COALESCE(author, '') = '' OR COALESCE(has_cover, 0) = 0)))
+                      {where_fmt}
+                    ORDER BY CASE WHEN COALESCE(format, 'epub') = 'pdf' THEN 0 ELSE 1 END,
+                             downloaded DESC, modified_time DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
                 ).fetchall()
-                book_items = [(r["id"], int(r["size"] or 0)) for r in rows]
+                book_items = [
+                    (r["id"], int(r["size"] or 0), r["format"], r["title"], r["author"])
+                    for r in rows
+                ]
             finally:
                 conn.close()
 
             if not book_items:
-                print("OPF enrichment: all books already verified.", flush=True)
+                print("Metadata enrichment: all books already verified.", flush=True)
                 return
             stats["total"] = len(book_items)
-            print(f"OPF enrichment (Range ZIP) starting for {len(book_items)} unverified books...", flush=True)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            print(f"Metadata enrichment starting for {len(book_items)} books...", flush=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 list(pool.map(_enrich_one, book_items))
         finally:
             with _META_ENRICH_LOCK:
@@ -2041,6 +2095,8 @@ def sync_pdfs_from_drive() -> dict:
                     conn.execute(f"DELETE FROM books WHERE id IN ({ph})", tuple(stale_pdfs))
     finally:
         conn.close()
+
+    start_background_metadata_enrichment(limit=5000, format_filter="pdf")
 
     return {
         "ok": True,
