@@ -736,6 +736,11 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
         row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         d = dict(row)
         d["format"] = d.get("format") or ("pdf" if (d.get("name") or "").lower().endswith(".pdf") else "epub")
+        raw_tags = d.get("tags") or "[]"
+        try:
+            d["tags"] = json.loads(raw_tags) if isinstance(raw_tags, str) else list(raw_tags)
+        except Exception:
+            d["tags"] = []
         d["manifest"] = json.loads(d["manifest_json"]) if d.get("manifest_json") else None
         d.pop("manifest_json", None)
         return d

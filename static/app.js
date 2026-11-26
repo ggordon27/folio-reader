@@ -877,7 +877,8 @@ function renderLibraryGrid() {
             ? `/api/books/${encodeURIComponent(book.id)}/cover`
             : "";
         const annCount = book.annotation_count || 0;
-        const tagsHtml = (book.tags || [])
+        const bookTags = Array.isArray(book.tags) ? book.tags : [];
+        const tagsHtml = bookTags
           .map(
             (t) => `<span class="book-tag-pill">${escapeHtml(t)}<button type="button" class="btn-rm-tag" data-book-id="${escapeHtml(book.id)}" data-tag="${escapeHtml(t)}" title="Remove tag">×</button></span>`
           )
@@ -3773,6 +3774,10 @@ async function compileUncompiledFolder(folderId, btnEl = null) {
 
     state.uncompiledFolders = data.uncompiled_folders || state.uncompiledFolders.filter((f) => f.folder_id !== folderId);
     if (data.book) {
+      if (typeof data.book.tags === "string") {
+        try { data.book.tags = JSON.parse(data.book.tags); } catch (_) { data.book.tags = []; }
+      }
+      if (!Array.isArray(data.book.tags)) data.book.tags = [];
       const idx = state.books.findIndex((b) => b.id === data.book.id);
       if (idx !== -1) state.books[idx] = data.book;
       else state.books.unshift(data.book);
