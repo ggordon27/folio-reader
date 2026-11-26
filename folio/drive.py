@@ -32,6 +32,7 @@ from .config import (
     GDRIVE_BIN,
     IGNORED_FOLDER_IDS,
     IGNORED_FOLDER_NAMES,
+    PDF_ROOT_FOLDERS,
 )
 from .db import (
     compute_progress_summary,
@@ -43,6 +44,12 @@ from .db import (
 )
 from .epub import invalidate_epub_cache, parse_epub_from_zip
 from .export import companion_filename_for, format_annotations_markdown
+from .pdf_reader import (
+    classify_pdf_folder,
+    clean_pdf_display_title,
+    compile_local_chapters_with_booktool,
+    parse_pdf_file,
+)
 
 _DRIVE_TOKEN_CACHE = {"access_token": "", "expires_at": 0.0}
 _DRIVE_TOKEN_LOCK = threading.Lock()
@@ -242,10 +249,14 @@ def is_ignored_epub(item_or_book: dict, extra_ignored_folder_ids: Optional[Set[s
 
 
 def deduplicate_books(books: list) -> list:
-    """Keeps one canonical entry per book, preferring annotated/cached/foldered copies."""
+    """Keeps one canonical entry per book, preferring annotated/EPUB/cached/foldered copies."""
     def _split_title(s: str) -> Tuple[str, str, str]:
-        s = re.sub(r"\.epub$", "", (s or "").lower())
+        s = re.sub(r"\.(?:epub|pdf)$", "", (s or "").lower())
+        s = re.sub(r"\s*-\s*complete$", "", s)
+        s = re.sub(r"_compiled$", "", s)
         s = re.sub(r"_for_geoffrey[-_]gordon", "", s)
+        if " -- " in s:
+            s = s.split(" -- ", 1)[1]
         parts = re.split(r"[:;—]", s, 1)
         main = re.sub(r"[^a-z0-9]+", " ", parts[0]).strip()
         sub = re.sub(r"[^a-z0-9]+", " ", parts[1]).strip() if len(parts) > 1 else ""
@@ -259,6 +270,7 @@ def deduplicate_books(books: list) -> list:
     def _score(b: dict) -> tuple:
         return (
             1 if (b.get("annotation_count") or 0) > 0 else 0,
+            1 if (b.get("format") or "epub") == "epub" else 0,
             1 if b.get("downloaded") else 0,
             1 if b.get("last_opened_at") else 0,
             1 if (b.get("folder_path") or "").strip() else 0,
@@ -320,6 +332,9 @@ def get_all_books() -> list:
                    b.annotations_drive_id, b.last_synced_at,
                    b.chapter_count, b.total_words, b.last_chapter_title, b.progress_percent,
                    COALESCE(b.has_cover, 0) AS has_cover,
+                   COALESCE(b.format, 'epub') AS format,
+                   COALESCE(b.pdf_category, '') AS pdf_category,
+                   COALESCE(b.page_count, 0) AS page_count,
                    COALESCE(ac.cnt, 0) AS annotation_count
             FROM books b
             LEFT JOIN (
@@ -549,8 +564,8 @@ def prune_stale_epub_cache(days: int = 10) -> dict:
 
 def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
     """
-    Ensures book.epub is downloaded locally and parsed directly from the ZIP archive
-    (no extracted/ directory). Populates chapter_text_fts and precomputed progress columns.
+    Ensures book.epub or book.pdf is downloaded locally and parsed.
+    Populates chapter_text_fts and precomputed progress columns.
     """
     with _get_book_lock(book_id):
         conn = get_db()
@@ -562,91 +577,165 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
         finally:
             conn.close()
 
+        is_pdf = (book.get("format") or "").lower() == "pdf" or (book.get("name") or "").lower().endswith(".pdf")
         book_folder = BOOKS_DIR / book_id
-        epub_file = book_folder / "book.epub"
-        legacy_extract_dir = book_folder / "extracted"
 
-        if not epub_file.exists() or not book.get("manifest_json"):
-            book_folder.mkdir(parents=True, exist_ok=True)
-            if not epub_file.exists():
-                if has_drive_oauth():
-                    drive_rest_download(book_id, epub_file)
-                else:
-                    proc = run_gdrive(["readonly", "download", book_id, "--out", str(epub_file)], timeout=120)
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"Failed to download EPUB from Google Drive: {proc.stderr.strip()}")
+        if is_pdf:
+            pdf_file = book_folder / "book.pdf"
+            if not pdf_file.exists() or not book.get("manifest_json"):
+                book_folder.mkdir(parents=True, exist_ok=True)
+                if not pdf_file.exists():
+                    if has_drive_oauth():
+                        drive_rest_download(book_id, pdf_file)
+                    else:
+                        proc = run_gdrive(["readonly", "download", book_id, "--out", str(pdf_file)], timeout=180)
+                        if proc.returncode != 0:
+                            raise RuntimeError(f"Failed to download PDF from Google Drive: {proc.stderr.strip()}")
 
-            parent_folder_id = book.get("parent_folder_id") or ""
-            if not parent_folder_id and not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
-                info_proc = run_gdrive(["readonly", "info", book_id, "--json"], timeout=30)
-                if info_proc.returncode == 0:
-                    try:
-                        info_data = json.loads(info_proc.stdout)
-                        parents = info_data.get("parents") or []
-                        if parents:
-                            parent_folder_id = parents[0]
-                    except Exception:
-                        pass
+                manifest, chapter_plain_texts, cover_bytes = parse_pdf_file(
+                    pdf_file,
+                    fallback_title=book.get("title") or book.get("name") or "",
+                    fallback_author=book.get("author") or "",
+                )
+                has_cov = 0
+                if cover_bytes and save_cover_thumbnail(book_id, cover_bytes, "cover.jpg"):
+                    has_cov = 1
 
-            manifest, chapter_plain_texts = parse_epub_from_zip(epub_file)
-            invalidate_epub_cache(book_id)
-            if legacy_extract_dir.exists():
-                shutil.rmtree(legacy_extract_dir, ignore_errors=True)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                ch_cnt, tot_words, ch_title, pct = compute_progress_summary(
+                    manifest, book.get("last_chapter_index") or 0, book.get("scroll_percent") or 0.0
+                )
 
-            now_iso = datetime.now(timezone.utc).isoformat()
-            ch_cnt, tot_words, ch_title, pct = compute_progress_summary(
-                manifest, book.get("last_chapter_index") or 0, book.get("scroll_percent") or 0.0
-            )
+                conn = get_db()
+                try:
+                    with conn:
+                        conn.execute(
+                            """
+                            UPDATE books
+                            SET title = COALESCE(NULLIF(?, ''), title),
+                                author = COALESCE(NULLIF(?, ''), author),
+                                publisher = COALESCE(NULLIF(?, ''), publisher),
+                                cover_href = ?,
+                                downloaded = 1, meta_verified = 1, last_opened_at = ?, manifest_json = ?,
+                                chapter_count = ?, total_words = ?, last_chapter_title = ?, progress_percent = ?,
+                                page_count = ?, has_cover = MAX(COALESCE(has_cover, 0), ?), format = 'pdf'
+                            WHERE id = ?
+                            """,
+                            (
+                                manifest["title"],
+                                manifest["author"],
+                                manifest["publisher"],
+                                manifest["cover_href"],
+                                now_iso,
+                                json.dumps(manifest),
+                                ch_cnt,
+                                tot_words,
+                                ch_title,
+                                pct,
+                                int(manifest.get("page_count") or 0),
+                                has_cov,
+                                book_id,
+                            ),
+                        )
+                        index_book_chapters_fts(book_id, chapter_plain_texts, conn=conn)
+                finally:
+                    conn.close()
 
-            conn = get_db()
-            try:
-                with conn:
-                    conn.execute(
-                        """
-                        UPDATE books
-                        SET title = ?, author = ?, publisher = ?, cover_href = ?, opf_dir = ?,
-                            parent_folder_id = COALESCE(NULLIF(?, ''), parent_folder_id),
-                            downloaded = 1, meta_verified = 1, last_opened_at = ?, manifest_json = ?,
-                            chapter_count = ?, total_words = ?, last_chapter_title = ?, progress_percent = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            manifest["title"],
-                            manifest["author"],
-                            manifest["publisher"],
-                            manifest["cover_href"],
-                            manifest["opf_dir"],
-                            parent_folder_id,
-                            now_iso,
-                            json.dumps(manifest),
-                            ch_cnt,
-                            tot_words,
-                            ch_title,
-                            pct,
-                            book_id,
-                        ),
-                    )
-                    index_book_chapters_fts(book_id, chapter_plain_texts, conn=conn)
-            finally:
-                conn.close()
-
-            try_import_annotations_from_drive(book_id, book["name"])
+                try_import_annotations_from_drive(book_id, book["name"])
+            else:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                conn = get_db()
+                try:
+                    with conn:
+                        conn.execute("UPDATE books SET last_opened_at = ? WHERE id = ?", (now_iso, book_id))
+                finally:
+                    conn.close()
         else:
-            # Clean up any leftover legacy extracted/ folder if book.epub is present
-            if legacy_extract_dir.exists():
-                shutil.rmtree(legacy_extract_dir, ignore_errors=True)
-            now_iso = datetime.now(timezone.utc).isoformat()
-            conn = get_db()
-            try:
-                with conn:
-                    conn.execute("UPDATE books SET last_opened_at = ? WHERE id = ?", (now_iso, book_id))
-            finally:
-                conn.close()
+            epub_file = book_folder / "book.epub"
+            legacy_extract_dir = book_folder / "extracted"
+
+            if not epub_file.exists() or not book.get("manifest_json"):
+                book_folder.mkdir(parents=True, exist_ok=True)
+                if not epub_file.exists():
+                    if has_drive_oauth():
+                        drive_rest_download(book_id, epub_file)
+                    else:
+                        proc = run_gdrive(["readonly", "download", book_id, "--out", str(epub_file)], timeout=120)
+                        if proc.returncode != 0:
+                            raise RuntimeError(f"Failed to download EPUB from Google Drive: {proc.stderr.strip()}")
+
+                parent_folder_id = book.get("parent_folder_id") or ""
+                if not parent_folder_id and not has_drive_oauth() and os.path.exists(GDRIVE_BIN):
+                    info_proc = run_gdrive(["readonly", "info", book_id, "--json"], timeout=30)
+                    if info_proc.returncode == 0:
+                        try:
+                            info_data = json.loads(info_proc.stdout)
+                            parents = info_data.get("parents") or []
+                            if parents:
+                                parent_folder_id = parents[0]
+                        except Exception:
+                            pass
+
+                manifest, chapter_plain_texts = parse_epub_from_zip(epub_file)
+                invalidate_epub_cache(book_id)
+                if legacy_extract_dir.exists():
+                    shutil.rmtree(legacy_extract_dir, ignore_errors=True)
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                ch_cnt, tot_words, ch_title, pct = compute_progress_summary(
+                    manifest, book.get("last_chapter_index") or 0, book.get("scroll_percent") or 0.0
+                )
+
+                conn = get_db()
+                try:
+                    with conn:
+                        conn.execute(
+                            """
+                            UPDATE books
+                            SET title = ?, author = ?, publisher = ?, cover_href = ?, opf_dir = ?,
+                                parent_folder_id = COALESCE(NULLIF(?, ''), parent_folder_id),
+                                downloaded = 1, meta_verified = 1, last_opened_at = ?, manifest_json = ?,
+                                chapter_count = ?, total_words = ?, last_chapter_title = ?, progress_percent = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                manifest["title"],
+                                manifest["author"],
+                                manifest["publisher"],
+                                manifest["cover_href"],
+                                manifest["opf_dir"],
+                                parent_folder_id,
+                                now_iso,
+                                json.dumps(manifest),
+                                ch_cnt,
+                                tot_words,
+                                ch_title,
+                                pct,
+                                book_id,
+                            ),
+                        )
+                        index_book_chapters_fts(book_id, chapter_plain_texts, conn=conn)
+                finally:
+                    conn.close()
+
+                try_import_annotations_from_drive(book_id, book["name"])
+            else:
+                # Clean up any leftover legacy extracted/ folder if book.epub is present
+                if legacy_extract_dir.exists():
+                    shutil.rmtree(legacy_extract_dir, ignore_errors=True)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                conn = get_db()
+                try:
+                    with conn:
+                        conn.execute("UPDATE books SET last_opened_at = ? WHERE id = ?", (now_iso, book_id))
+                finally:
+                    conn.close()
 
     conn = get_db()
     try:
         row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         d = dict(row)
+        d["format"] = d.get("format") or ("pdf" if (d.get("name") or "").lower().endswith(".pdf") else "epub")
         d["manifest"] = json.loads(d["manifest_json"]) if d.get("manifest_json") else None
         d.pop("manifest_json", None)
         return d
@@ -654,7 +743,142 @@ def ensure_book_downloaded_and_parsed(book_id: str) -> dict:
         conn.close()
 
 
-def sync_library_from_drive() -> list:
+def _format_drive_folder_path(
+    folder_id: str,
+    folder_cache: Dict[str, dict],
+    fetch_folder_fn,
+) -> str:
+    """Walks Drive parent folders up to root and formats like 'marxism / marxist-feminism / social reproduction'."""
+    parts: List[str] = []
+    cur = folder_id
+    seen: Set[str] = set()
+    for _ in range(12):
+        if not cur or cur in seen:
+            break
+        seen.add(cur)
+        info = folder_cache.get(cur)
+        if info is None:
+            info = fetch_folder_fn(cur)
+            if info:
+                folder_cache[cur] = info
+        if not info:
+            break
+        fname = (info.get("name") or "").strip()
+        parent_id = (info.get("parent_id") or "").strip()
+        if fname.lower() in ("my drive", "drive"):
+            break
+        if fname:
+            parts.append(fname)
+        cur = parent_id
+    parts.reverse()
+    while parts and parts[0].lower() in ("nerd stuff", "my drive"):
+        parts.pop(0)
+    return " / ".join(parts)
+
+
+def _resolve_missing_folder_paths(items: list, folder_map: dict, existing_foldered: Set[str]):
+    """Populates parents and folder_path for Drive items missing from static folder_map."""
+    cache_path = DATA_DIR / "folder_id_cache.json"
+    folder_cache: Dict[str, dict] = {}
+    if cache_path.exists():
+        try:
+            folder_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            folder_cache = {}
+
+    use_oauth = has_drive_oauth()
+    if use_oauth:
+        # Bulk-fetch folders once when OAuth is available
+        if not folder_cache:
+            page_token = ""
+            while True:
+                params = {
+                    "q": "trashed = false and mimeType = 'application/vnd.google-apps.folder'",
+                    "fields": "nextPageToken, files(id, name, parents)",
+                    "pageSize": "1000",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                try:
+                    data = drive_rest_json("https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params))
+                except Exception:
+                    break
+                for f in data.get("files") or []:
+                    ps = f.get("parents") or []
+                    folder_cache[f["id"]] = {"name": f.get("name", ""), "parent_id": ps[0] if ps else ""}
+                page_token = data.get("nextPageToken") or ""
+                if not page_token:
+                    break
+
+        def _fetch_oauth(fid: str) -> Optional[dict]:
+            try:
+                d = drive_rest_json(
+                    f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(fid)}?fields=id,name,parents"
+                )
+                ps = d.get("parents") or []
+                return {"name": d.get("name", ""), "parent_id": ps[0] if ps else ""}
+            except Exception:
+                return None
+
+        fetch_fn = _fetch_oauth
+    else:
+        cache_lock = threading.Lock()
+
+        def _fetch_gdrive(fid: str) -> Optional[dict]:
+            try:
+                proc = run_gdrive(["readonly", "info", fid, "--json"], timeout=15)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    d = json.loads(proc.stdout)
+                    ps = d.get("parents") or []
+                    return {"name": d.get("name", ""), "parent_id": ps[0] if ps else ""}
+            except Exception:
+                pass
+            return None
+
+        fetch_fn = _fetch_gdrive
+
+        # For gdrive CLI, search results omit parents; fetch info for items missing folder_path
+        need_info = [
+            it for it in items
+            if not it.get("folder_path")
+            and it.get("name") not in folder_map
+            and it.get("id") not in existing_foldered
+            and not it.get("parents")
+        ][:80]
+        if need_info:
+            def _populate_parents(it: dict):
+                try:
+                    proc = run_gdrive(["readonly", "info", it["id"], "--json"], timeout=15)
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        d = json.loads(proc.stdout)
+                        if d.get("parents"):
+                            with cache_lock:
+                                it["parents"] = d["parents"]
+                except Exception:
+                    pass
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_populate_parents, need_info))
+
+    for it in items:
+        if it.get("folder_path"):
+            continue
+        if it.get("name") in folder_map:
+            it["folder_path"] = folder_map[it["name"]]
+            continue
+        parents = it.get("parents") or []
+        if parents:
+            fp = _format_drive_folder_path(parents[0], folder_cache, fetch_fn)
+            if fp:
+                it["folder_path"] = fp
+
+    try:
+        cache_path.write_text(json.dumps(folder_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def sync_library_from_drive(allow_cache_fallback: bool = True) -> list:
     """Syncs EPUB catalog from Google Drive (OAuth REST or local gdrive CLI) into SQLite."""
     cache_json_path = DATA_DIR / "drive_epubs.json"
     folder_map_path = DATA_DIR / "folder_map.json"
@@ -714,46 +938,57 @@ def sync_library_from_drive() -> list:
     all_fetched = {}
     cursor_before = None
     gdrive_ok = False
+    last_gdrive_err = ""
     if has_drive_oauth():
         for item in drive_rest_search_epubs():
             all_fetched[item["id"]] = item
         gdrive_ok = True
     elif not os.path.exists(GDRIVE_BIN):
         raise RuntimeError("Google Drive OAuth is not connected. Open Settings -> Connect Google Drive via OAuth.")
-
-    while not gdrive_ok:
-        cmd = ["readonly", "search", "--name-contains", ".epub", "--max", "100", "--json"]
-        if cursor_before:
-            cmd.extend(["--modified-before", cursor_before.replace("Z", "")])
-        proc = run_gdrive(cmd, timeout=45)
-        if proc.returncode != 0 or not proc.stdout.strip():
-            break
-        gdrive_ok = True
-        batch = json.loads(proc.stdout)
-        if not batch:
-            break
-        new_count = 0
-        for item in batch:
-            if item["id"] not in all_fetched:
-                all_fetched[item["id"]] = item
-                new_count += 1
-        if len(batch) < 100 or new_count == 0:
-            break
-        cursor_before = batch[-1].get("modifiedTime")
+    else:
+        while True:
+            cmd = ["readonly", "search", "--name-contains", ".epub", "--max", "100", "--json"]
+            if cursor_before:
+                cmd.extend(["--modified-before", cursor_before.replace("Z", "")])
+            proc = run_gdrive(cmd, timeout=45)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                last_gdrive_err = (proc.stderr or proc.stdout or f"exit code {proc.returncode}").strip()
+                break
+            gdrive_ok = True
+            batch = json.loads(proc.stdout)
+            if not batch:
+                break
+            new_count = 0
+            for item in batch:
+                if item["id"] not in all_fetched:
+                    all_fetched[item["id"]] = item
+                    new_count += 1
+            if len(batch) < 100 or new_count == 0:
+                break
+            cursor_before = batch[-1].get("modifiedTime")
 
     if gdrive_ok and all_fetched:
         items = list(all_fetched.values())
-        for it in items:
-            if not it.get("folder_path") and it.get("name") in folder_map:
-                it["folder_path"] = folder_map[it["name"]]
+        conn_f = get_db()
+        try:
+            existing_foldered = {
+                r["id"] for r in conn_f.execute("SELECT id FROM books WHERE COALESCE(folder_path, '') != ''").fetchall()
+            }
+        finally:
+            conn_f.close()
+        _resolve_missing_folder_paths(items, folder_map, existing_foldered)
         try:
             cache_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-    elif cache_json_path.exists():
+    elif allow_cache_fallback and cache_json_path.exists():
         items = json.loads(cache_json_path.read_text(encoding="utf-8"))
     else:
-        raise RuntimeError("Could not load EPUB catalog from Google Drive")
+        detail = f" ({last_gdrive_err})" if last_gdrive_err else ""
+        raise RuntimeError(
+            f"Could not sync EPUBs from Google Drive{detail}. "
+            "Open Settings -> Connect Google Drive via OAuth."
+        )
 
     conn = get_db()
     try:
@@ -1483,3 +1718,474 @@ def start_periodic_drive_sync(interval_seconds: int = 900):
 
     t = threading.Thread(target=_loop, daemon=True, name="folio-periodic-drive-sync")
     t.start()
+
+
+# --- Scoped PDF Sync & BookTool Compilation ---
+
+
+def _collect_scoped_pdfs_oauth() -> Tuple[Dict[str, dict], Dict[str, List[dict]]]:
+    """
+    Uses Google Drive OAuth REST API to build the folder tree under PDF_ROOT_FOLDERS
+    and collect all PDFs grouped by parent folder_id.
+    Returns (folder_meta_by_id, pdfs_by_folder_id).
+    """
+    all_folders: Dict[str, dict] = {}
+    page_token = ""
+    while True:
+        params = {
+            "q": "trashed = false and mimeType = 'application/vnd.google-apps.folder'",
+            "fields": "nextPageToken, files(id, name, parents)",
+            "pageSize": "1000",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        data = drive_rest_json("https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params))
+        for f in data.get("files") or []:
+            ps = f.get("parents") or []
+            all_folders[f["id"]] = {"id": f["id"], "name": f.get("name", ""), "parent_id": ps[0] if ps else ""}
+        page_token = data.get("nextPageToken") or ""
+        if not page_token:
+            break
+
+    # Build children adjacency map
+    children_map: Dict[str, List[str]] = {}
+    for fid, info in all_folders.items():
+        pid = info["parent_id"]
+        if pid:
+            children_map.setdefault(pid, []).append(fid)
+
+    # BFS from each PDF_ROOT_FOLDERS root, skipping ignored folders
+    scoped_folders: Dict[str, dict] = {}
+    for root_id, root_name in PDF_ROOT_FOLDERS.items():
+        queue = [(root_id, root_name, root_name, root_name, {root_id})]
+        while queue:
+            fid, fname, fpath, src_root, anc = queue.pop(0)
+            if fid in scoped_folders:
+                continue
+            scoped_folders[fid] = {
+                "id": fid,
+                "name": fname,
+                "folder_path": fpath,
+                "source_root": src_root,
+                "ancestors": set(anc),
+            }
+            for cid in children_map.get(fid, []):
+                cinfo = all_folders.get(cid)
+                if not cinfo:
+                    continue
+                cname = (cinfo.get("name") or "").strip()
+                if cid in IGNORED_FOLDER_IDS or cname.lower() in IGNORED_FOLDER_NAMES:
+                    continue
+                cpath = f"{fpath} / {cname}" if fpath else cname
+                queue.append((cid, cname, cpath, src_root, anc | {cid}))
+
+    # Fetch all non-trashed PDFs and keep only those inside scoped_folders
+    pdfs_by_folder: Dict[str, List[dict]] = {}
+    page_token = ""
+    while True:
+        params = {
+            "q": "trashed = false and mimeType = 'application/pdf'",
+            "fields": "nextPageToken, files(id, name, size, modifiedTime, webViewLink, parents)",
+            "pageSize": "1000",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        data = drive_rest_json("https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params))
+        for item in data.get("files") or []:
+            parents = item.get("parents") or []
+            pid = parents[0] if parents else ""
+            if pid in scoped_folders:
+                pdfs_by_folder.setdefault(pid, []).append(item)
+        page_token = data.get("nextPageToken") or ""
+        if not page_token:
+            break
+
+    return scoped_folders, pdfs_by_folder
+
+
+def _collect_scoped_pdfs_gdrive() -> Tuple[Dict[str, dict], Dict[str, List[dict]]]:
+    """
+    Walks PDF_ROOT_FOLDERS concurrently using the local `gdrive` CLI.
+    Returns (folder_meta_by_id, pdfs_by_folder_id).
+    """
+    scoped_folders: Dict[str, dict] = {}
+    pdfs_by_folder: Dict[str, List[dict]] = {}
+
+    def _ls_folder(fid: str) -> List[dict]:
+        proc = run_gdrive(["readonly", "ls", fid, "--max", "500", "--json"], timeout=45)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        try:
+            data = json.loads(proc.stdout)
+            return data.get("files", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        except Exception:
+            return []
+
+    frontier = [
+        (root_id, root_name, root_name, root_name, {root_id})
+        for root_id, root_name in PDF_ROOT_FOLDERS.items()
+    ]
+    visited: Set[str] = set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        while frontier:
+            batch = []
+            for entry in frontier:
+                fid = entry[0]
+                if fid not in visited:
+                    visited.add(fid)
+                    batch.append(entry)
+            frontier = []
+            if not batch:
+                break
+
+            futures = {pool.submit(_ls_folder, entry[0]): entry for entry in batch}
+            for fut in concurrent.futures.as_completed(futures):
+                fid, fname, fpath, src_root, anc = futures[fut]
+                scoped_folders[fid] = {
+                    "id": fid,
+                    "name": fname,
+                    "folder_path": fpath,
+                    "source_root": src_root,
+                    "ancestors": set(anc),
+                }
+                items = fut.result() or []
+                for it in items:
+                    mime = it.get("mimeType") or ""
+                    iname = (it.get("name") or "").strip()
+                    iid = it.get("id") or ""
+                    if not iid:
+                        continue
+                    if mime == "application/vnd.google-apps.folder":
+                        if iid in IGNORED_FOLDER_IDS or iname.lower() in IGNORED_FOLDER_NAMES:
+                            continue
+                        cpath = f"{fpath} / {iname}" if fpath else iname
+                        frontier.append((iid, iname, cpath, src_root, anc | {iid}))
+                    elif mime == "application/pdf" or iname.lower().endswith(".pdf"):
+                        it.setdefault("parents", [fid])
+                        pdfs_by_folder.setdefault(fid, []).append(it)
+
+    return scoped_folders, pdfs_by_folder
+
+
+def list_uncompiled_folders() -> List[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT folder_id, folder_name, folder_path, chapter_count, total_size, source_root, sample_files, updated_at
+            FROM uncompiled_folders
+            ORDER BY folder_name COLLATE NOCASE ASC
+            """
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["sample_files"] = json.loads(d.get("sample_files") or "[]")
+            except Exception:
+                d["sample_files"] = []
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def sync_pdfs_from_drive() -> dict:
+    """
+    Syncs PDFs from scoped Google Drive roots (Cambridge Core + nerd stuff) into SQLite,
+    filtering out chapter-split book PDFs and recording chapter-only book folders in
+    `uncompiled_folders` for one-click BookTool compilation.
+    """
+    if has_drive_oauth():
+        scoped_folders, pdfs_by_folder = _collect_scoped_pdfs_oauth()
+    elif os.path.exists(GDRIVE_BIN):
+        scoped_folders, pdfs_by_folder = _collect_scoped_pdfs_gdrive()
+    else:
+        raise RuntimeError("Google Drive is not connected. Open Settings -> Connect Google Drive via OAuth.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    kept_ids: Set[str] = set()
+    uncompiled_ids: Set[str] = set()
+    skipped_chapters = 0
+
+    try:
+        hidden_ids = {r["id"] for r in conn.execute("SELECT id FROM hidden_books").fetchall()}
+
+        with conn:
+            for fid, pdfs in pdfs_by_folder.items():
+                fmeta = scoped_folders.get(fid)
+                if not fmeta:
+                    continue
+                fname = fmeta["name"]
+                fpath = fmeta["folder_path"]
+                src_root = fmeta["source_root"]
+                anc = fmeta["ancestors"]
+
+                # Clean display folder path (strip leading "nerd stuff / " to match EPUB style)
+                display_path = re.sub(r"^nerd stuff\s*/\s*", "", fpath, flags=re.IGNORECASE).strip()
+
+                status, kept = classify_pdf_folder(fid, fname, fpath, pdfs, anc)
+
+                if status in ("cambridge_book_uncompiled", "chapter_book_uncompiled"):
+                    uncompiled_ids.add(fid)
+                    skipped_chapters += len(pdfs)
+                    total_sz = sum(int(p.get("size") or 0) for p in pdfs)
+                    samples = sorted([p.get("name") or "" for p in pdfs])[:6]
+                    conn.execute(
+                        """
+                        INSERT INTO uncompiled_folders
+                        (folder_id, folder_name, folder_path, chapter_count, total_size, source_root, sample_files, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(folder_id) DO UPDATE SET
+                            folder_name = excluded.folder_name,
+                            folder_path = excluded.folder_path,
+                            chapter_count = excluded.chapter_count,
+                            total_size = excluded.total_size,
+                            source_root = excluded.source_root,
+                            sample_files = excluded.sample_files,
+                            updated_at = excluded.updated_at
+                        """,
+                        (fid, fname, display_path, len(pdfs), total_sz, src_root, json.dumps(samples), now_iso),
+                    )
+                    # Ensure individual chapter PDFs from this folder are not in books
+                    ch_ids = [p["id"] for p in pdfs if p.get("id")]
+                    if ch_ids:
+                        ph = ",".join("?" for _ in ch_ids)
+                        conn.execute(f"DELETE FROM books WHERE id IN ({ph}) AND format = 'pdf'", tuple(ch_ids))
+                    continue
+
+                # If folder was previously uncompiled and now has a full book, remove from uncompiled_folders
+                conn.execute("DELETE FROM uncompiled_folders WHERE folder_id = ?", (fid,))
+                kept_set = {p["id"] for p in kept if p.get("id")}
+                skipped_chapters += max(0, len(pdfs) - len(kept_set))
+
+                # Delete any filtered-out sibling chapter PDFs that might have been in books
+                dropped_ids = [p["id"] for p in pdfs if p.get("id") and p["id"] not in kept_set]
+                if dropped_ids:
+                    ph = ",".join("?" for _ in dropped_ids)
+                    conn.execute(f"DELETE FROM books WHERE id IN ({ph}) AND format = 'pdf'", tuple(dropped_ids))
+
+                for item in kept:
+                    file_id = item.get("id")
+                    if not file_id or file_id in hidden_ids:
+                        continue
+                    kept_ids.add(file_id)
+                    name = item.get("name") or ""
+                    size = int(item.get("size") or 0)
+                    mod_time = item.get("modifiedTime") or ""
+                    web_link = item.get("webViewLink") or ""
+                    pdf_cat = item.get("pdf_category") or "book"
+                    clean_title, clean_author = clean_pdf_display_title(name, folder_name=fname)
+
+                    existing = conn.execute("SELECT id, meta_verified FROM books WHERE id = ?", (file_id,)).fetchone()
+                    if existing:
+                        conn.execute(
+                            """
+                            UPDATE books
+                            SET name = ?, size = ?, modified_time = ?, web_view_link = ?,
+                                parent_folder_id = ?, folder_path = ?, format = 'pdf', pdf_category = ?
+                            WHERE id = ?
+                            """,
+                            (name, size, mod_time, web_link, fid, display_path, pdf_cat, file_id),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO books
+                            (id, name, title, author, size, modified_time, web_view_link,
+                             parent_folder_id, folder_path, downloaded, format, pdf_category)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pdf', ?)
+                            """,
+                            (file_id, name, clean_title, clean_author, size, mod_time, web_link, fid, display_path, pdf_cat),
+                        )
+
+            # Remove stale uncompiled_folders entries that no longer exist
+            if uncompiled_ids:
+                ph = ",".join("?" for _ in uncompiled_ids)
+                conn.execute(f"DELETE FROM uncompiled_folders WHERE folder_id NOT IN ({ph})", tuple(uncompiled_ids))
+            else:
+                conn.execute("DELETE FROM uncompiled_folders")
+
+            # Remove PDFs that were deleted/moved out of scoped folders (preserving annotated ones)
+            if kept_ids:
+                existing_pdfs = [
+                    r["id"]
+                    for r in conn.execute(
+                        """
+                        SELECT b.id FROM books b
+                        WHERE b.format = 'pdf'
+                          AND NOT EXISTS (SELECT 1 FROM annotations a WHERE a.book_id = b.id)
+                        """
+                    ).fetchall()
+                ]
+                stale_pdfs = [pid for pid in existing_pdfs if pid not in kept_ids]
+                if stale_pdfs:
+                    ph = ",".join("?" for _ in stale_pdfs)
+                    conn.execute(f"DELETE FROM books WHERE id IN ({ph})", tuple(stale_pdfs))
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "pdf_count": len(kept_ids),
+        "uncompiled_count": len(uncompiled_ids),
+        "skipped_chapter_pdfs": skipped_chapters,
+        "books": get_all_books(),
+        "uncompiled_folders": list_uncompiled_folders(),
+    }
+
+
+def compile_uncompiled_folder_to_drive(folder_id: str) -> dict:
+    """
+    Downloads chapter PDFs from an uncompiled Drive folder, compiles them into a single
+    full-book PDF with TOC bookmarks via BookTool (or built-in PyMuPDF fallback), uploads
+    the full-book PDF back into that Drive folder, and registers it in Folio immediately.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM uncompiled_folders WHERE folder_id = ?", (folder_id,)).fetchone()
+    finally:
+        conn.close()
+
+    folder_name = (row["folder_name"] if row else "") or ""
+    folder_path = (row["folder_path"] if row else "") or ""
+
+    # List chapter PDFs directly from Drive
+    if has_drive_oauth():
+        if not folder_name:
+            info = drive_rest_json(f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(folder_id)}?fields=id,name")
+            folder_name = info.get("name") or folder_id
+        params = {
+            "q": f"trashed = false and '{folder_id}' in parents and mimeType = 'application/pdf'",
+            "fields": "files(id, name, size)",
+            "pageSize": "500",
+        }
+        data = drive_rest_json("https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params))
+        chapter_files = data.get("files") or []
+    elif os.path.exists(GDRIVE_BIN):
+        if not folder_name:
+            iproc = run_gdrive(["readonly", "info", folder_id, "--json"], timeout=30)
+            if iproc.returncode == 0 and iproc.stdout.strip():
+                folder_name = json.loads(iproc.stdout).get("name") or folder_id
+        lproc = run_gdrive(["readonly", "ls", folder_id, "--max", "500", "--json"], timeout=45)
+        if lproc.returncode != 0:
+            raise RuntimeError(f"Failed to list Drive folder {folder_id}: {lproc.stderr.strip()}")
+        raw_items = json.loads(lproc.stdout)
+        items = raw_items.get("files", []) if isinstance(raw_items, dict) else raw_items
+        chapter_files = [it for it in items if (it.get("name") or "").lower().endswith(".pdf")]
+    else:
+        raise RuntimeError("Google Drive is not connected.")
+
+    if not chapter_files:
+        raise RuntimeError(f"No PDF files found inside Drive folder '{folder_name}'.")
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="folio_compile_"))
+    try:
+        ch_dir = tmp_root / "chapters"
+        out_dir = tmp_root / "out"
+        ch_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download chapter PDFs concurrently
+        def _dl_one(cf: dict):
+            safe_fn = Path(cf["name"]).name
+            dest = ch_dir / safe_fn
+            if has_drive_oauth():
+                drive_rest_download(cf["id"], dest)
+            else:
+                p = run_gdrive(["readonly", "download", cf["id"], "--out", str(dest)], timeout=120)
+                if p.returncode != 0:
+                    raise RuntimeError(f"Download failed for {safe_fn}: {p.stderr.strip()}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(_dl_one, chapter_files))
+
+        compiled_path, meta = compile_local_chapters_with_booktool(ch_dir, out_dir, folder_name)
+        compiled_bytes = compiled_path.read_bytes()
+        compiled_name = compiled_path.name
+        # Ensure name ends with " - Complete.pdf" if it collides with an existing chapter name
+        existing_names = {c["name"].lower() for c in chapter_files}
+        if compiled_name.lower() in existing_names:
+            stem = re.sub(r"\.pdf$", "", compiled_name, flags=re.IGNORECASE)
+            compiled_name = f"{stem} - Complete.pdf"
+
+        # Upload back to Drive inside the same book folder
+        if has_drive_oauth():
+            uploaded = drive_rest_upload_file(
+                name=compiled_name,
+                data_bytes=compiled_bytes,
+                mime_type="application/pdf",
+                parent_id=folder_id,
+            )
+            new_file_id = uploaded["id"]
+            web_link = uploaded.get("webViewLink") or ""
+        else:
+            upload_path = out_dir / compiled_name
+            if upload_path != compiled_path:
+                shutil.copy2(compiled_path, upload_path)
+            uproc = run_gdrive(
+                ["mutate", "upload", str(upload_path), "--parent", folder_id, "--mime-type", "application/pdf", "--json"],
+                timeout=180,
+            )
+            if uproc.returncode != 0:
+                raise RuntimeError(f"Failed to upload compiled PDF to Drive: {uproc.stderr.strip()}")
+            udata = json.loads(uproc.stdout)
+            new_file_id = udata["id"]
+            web_link = udata.get("webViewLink") or ""
+
+        # Cache the compiled PDF locally immediately so opening it is instant!
+        bdir = BOOKS_DIR / new_file_id
+        bdir.mkdir(parents=True, exist_ok=True)
+        local_pdf = bdir / "book.pdf"
+        shutil.copy2(compiled_path, local_pdf)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        clean_title = meta.get("title") or folder_name
+        clean_author = meta.get("author") or ""
+        conn = get_db()
+        try:
+            with conn:
+                conn.execute("DELETE FROM uncompiled_folders WHERE folder_id = ?", (folder_id,))
+                conn.execute(
+                    """
+                    INSERT INTO books
+                    (id, name, title, author, size, modified_time, web_view_link,
+                     parent_folder_id, folder_path, downloaded, format, pdf_category, page_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pdf', 'book', ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        title = excluded.title,
+                        size = excluded.size,
+                        modified_time = excluded.modified_time,
+                        format = 'pdf',
+                        pdf_category = 'book',
+                        page_count = excluded.page_count
+                    """,
+                    (
+                        new_file_id,
+                        compiled_name,
+                        clean_title,
+                        clean_author,
+                        len(compiled_bytes),
+                        now_iso,
+                        web_link,
+                        folder_id,
+                        folder_path or folder_name,
+                        int(meta.get("total_pages") or 0),
+                    ),
+                )
+        finally:
+            conn.close()
+
+        # Parse & index right away so cover + FTS + TOC are immediately ready
+        book = ensure_book_downloaded_and_parsed(new_file_id)
+        return {
+            "ok": True,
+            "book": book,
+            "compile_meta": meta,
+            "uncompiled_folders": list_uncompiled_folders(),
+        }
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)

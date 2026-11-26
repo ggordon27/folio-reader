@@ -33,10 +33,23 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1/interactions"
 # Ensure extra mime types
 mimetypes.add_type("application/xhtml+xml", ".xhtml")
 mimetypes.add_type("application/epub+zip", ".epub")
+mimetypes.add_type("application/pdf", ".pdf")
 mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("font/woff", ".woff")
 mimetypes.add_type("font/ttf", ".ttf")
 mimetypes.add_type("font/otf", ".otf")
+
+# Scoped Google Drive root folders for PDF library indexing
+PDF_ROOT_FOLDERS = {
+    "1E_nAJz4PPf3bQUn201zB8heqi8XHbspD": "Cambridge Core",
+    "1KPYwaevhwVDoLyj_RhtBHTl6MRMrPBpw": "nerd stuff",
+}
+CAMBRIDGE_CORE_BOOKS_FOLDER_ID = "157uoUUZDXkU5dnU6MI1upmWJDv5acds8"
+CAMBRIDGE_CORE_ELEMENTS_FOLDER_ID = "1yXlXzDZufG18CYYxKiVY6Q-9yPHd5Sgm"
+CAMBRIDGE_CORE_JOURNALS_FOLDER_ID = "1ptXAYy9Gu48wEPj79LiF7hDgTMzbOaT7"
+
+# Optional sibling BookTool project path for compiling chapter-only PDF folders
+BOOKTOOL_DIR = Path(os.environ.get("BOOKTOOL_DIR", "").strip() or (BASE_DIR.parent / "booktool")).expanduser()
 
 HIGHLIGHT_SCHEMA = {
     "blue": {

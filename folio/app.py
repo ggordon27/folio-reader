@@ -16,10 +16,10 @@ from typing import Any, Dict
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from .auth import get_active_passcode, is_request_authenticated, make_session_token
-from .config import DATA_DIR, GDRIVE_BIN, HIGHLIGHT_SCHEMA, STATIC_DIR
+from .config import BOOKS_DIR, DATA_DIR, GDRIVE_BIN, HIGHLIGHT_SCHEMA, STATIC_DIR
 from .db import (
     compute_progress_summary,
     delete_annotation_fts,
@@ -31,6 +31,7 @@ from .db import (
     upsert_annotation_fts,
 )
 from .drive import (
+    compile_uncompiled_folder_to_drive,
     ensure_book_downloaded_and_parsed,
     export_notes_to_gdoc,
     find_cached_cover,
@@ -40,6 +41,7 @@ from .drive import (
     has_drive_oauth,
     hide_book,
     list_hidden_books,
+    list_uncompiled_folders,
     prune_stale_epub_cache,
     restore_hidden_book,
     save_cover_thumbnail,
@@ -49,6 +51,7 @@ from .drive import (
     start_periodic_drive_sync,
     sync_annotations_to_drive,
     sync_library_from_drive,
+    sync_pdfs_from_drive,
 )
 from .epub import (
     get_chapter_plain_text,
@@ -84,7 +87,7 @@ _PUBLIC_PATHS = {
 @app.middleware("http")
 async def auth_and_error_middleware(request: Request, call_next):
     path = request.url.path
-    if (path.startswith("/api/") or path.startswith("/epub/")) and path not in _PUBLIC_PATHS:
+    if (path.startswith("/api/") or path.startswith("/epub/") or path.startswith("/pdf/")) and path not in _PUBLIC_PATHS:
         if not is_request_authenticated(request):
             return JSONResponse(
                 {"error": "Authentication required", "code": "AUTH_REQUIRED"},
@@ -281,13 +284,46 @@ def api_books():
     books = get_all_books()
     if not books:
         books = sync_library_from_drive()
-    return JSONResponse({"books": books}, headers={"Cache-Control": "no-store"})
+    uncompiled = list_uncompiled_folders()
+    return JSONResponse(
+        {"books": books, "uncompiled_folders": uncompiled},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/books/sync")
-def api_books_sync():
-    books = sync_library_from_drive()
-    return {"books": books}
+def api_books_sync(scope: str = Query("epub")):
+    try:
+        if scope == "pdf":
+            return sync_pdfs_from_drive()
+        books = sync_library_from_drive(allow_cache_fallback=False)
+        if scope == "all":
+            pdf_res = sync_pdfs_from_drive()
+            return pdf_res
+        return {"books": books, "uncompiled_folders": list_uncompiled_folders()}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/api/pdfs/uncompiled")
+def api_uncompiled_pdfs():
+    return JSONResponse({"uncompiled_folders": list_uncompiled_folders()}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/pdfs/sync")
+def api_pdfs_sync():
+    try:
+        return sync_pdfs_from_drive()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.post("/api/pdfs/compile/{folder_id}")
+def api_compile_uncompiled_folder(folder_id: str):
+    try:
+        return compile_uncompiled_folder_to_drive(folder_id)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @app.get("/api/search")
@@ -363,19 +399,33 @@ def api_book_cover(book_id: str):
         )
     conn = get_db()
     try:
-        row = conn.execute("SELECT cover_href, downloaded FROM books WHERE id = ?", (book_id,)).fetchone()
+        row = conn.execute("SELECT cover_href, downloaded, COALESCE(format, 'epub') AS format FROM books WHERE id = ?", (book_id,)).fetchone()
     finally:
         conn.close()
-    if row and row["cover_href"] and row["downloaded"]:
-        res = read_epub_resource(book_id, row["cover_href"])
-        if res:
-            raw, ctype = res
-            save_cover_thumbnail(book_id, raw, row["cover_href"])
-            return Response(
-                content=raw,
-                media_type=ctype,
-                headers={"Cache-Control": "private, max-age=604800"},
-            )
+    if row and row["downloaded"]:
+        if row["format"] == "pdf":
+            pdf_path = BOOKS_DIR / book_id / "book.pdf"
+            if pdf_path.is_file():
+                from .pdf_reader import render_pdf_cover
+
+                raw = render_pdf_cover(pdf_path)
+                if raw:
+                    save_cover_thumbnail(book_id, raw, "cover.jpg")
+                    return Response(
+                        content=raw,
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=604800"},
+                    )
+        elif row["cover_href"]:
+            res = read_epub_resource(book_id, row["cover_href"])
+            if res:
+                raw, ctype = res
+                save_cover_thumbnail(book_id, raw, row["cover_href"])
+                return Response(
+                    content=raw,
+                    media_type=ctype,
+                    headers={"Cache-Control": "private, max-age=604800"},
+                )
     return Response(content="Cover not found", status_code=404)
 
 
@@ -1042,6 +1092,20 @@ def serve_epub_resource(book_id: str, rel_path: str):
     return Response(
         content=raw,
         media_type=ctype,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.get("/pdf/{book_id}/book.pdf")
+def serve_pdf_file(book_id: str):
+    pdf_path = BOOKS_DIR / book_id / "book.pdf"
+    if not pdf_path.is_file():
+        ensure_book_downloaded_and_parsed(book_id)
+    if not pdf_path.is_file():
+        return Response(content="PDF not found", status_code=404)
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
         headers={"Cache-Control": "private, max-age=86400"},
     )
 

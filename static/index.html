@@ -7,8 +7,9 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-  <title>Folio — Google Drive EPUB Reader & Gemini Companion</title>
-  <link rel="stylesheet" href="/styles.css?v=4" />
+  <title>Folio — Google Drive EPUB & PDF Reader & Gemini Companion</title>
+  <link rel="stylesheet" href="/styles.css?v=5" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css" />
 </head>
 <body>
   <!-- TOP HEADER BAR -->
@@ -24,7 +25,7 @@
         </div>
         <div>
           <span class="brand-title">Folio</span>
-          <span class="brand-subtitle">Drive EPUB & Gemini Reader</span>
+          <span class="brand-subtitle">Drive EPUB, PDF &amp; Gemini Reader</span>
         </div>
       </div>
       <div id="activeBookHeader" class="active-book-header hidden">
@@ -147,11 +148,33 @@
   <!-- VIEW 1: LIBRARY SHELF VIEW -->
   <main id="libraryView" class="library-view">
     <div class="library-hero">
-      <div class="library-hero-text">
-        <h1>Your Google Drive EPUB Library</h1>
-        <p>Connected via your signed-in Google Drive CLI. Select any book to download, read, highlight, annotate, and discuss with Gemini.</p>
+      <div class="library-hero-top">
+        <div class="library-hero-text">
+          <h1 id="libraryHeroTitle">Your Google Drive EPUB Library</h1>
+          <p id="libraryHeroDesc">Connected to Google Drive. Select any book to download, read, highlight, annotate, and discuss with Gemini.</p>
+        </div>
+        <div class="shelf-switcher" role="tablist" aria-label="Library Format">
+          <button id="btnShelfEpub" class="shelf-tab active" data-format="epub" role="tab" aria-selected="true">
+            EPUBs <span id="epubCountPill" class="shelf-count">0</span>
+          </button>
+          <button id="btnShelfPdf" class="shelf-tab" data-format="pdf" role="tab" aria-selected="false">
+            PDFs <span id="pdfCountPill" class="shelf-count">0</span>
+          </button>
+          <button id="btnShelfAll" class="shelf-tab" data-format="all" role="tab" aria-selected="false">
+            All <span id="allCountPill" class="shelf-count">0</span>
+          </button>
+        </div>
       </div>
       <div class="library-actions">
+        <select id="pdfCategorySelect" class="select-compact hidden" style="height: 33px; padding: 0 10px; max-width: 155px;" title="Filter PDF Type">
+          <option value="">All PDF Types</option>
+          <option value="book">Books</option>
+          <option value="element">Cambridge Elements</option>
+          <option value="article">Articles &amp; Essays</option>
+        </select>
+        <button id="btnOpenUncompiled" class="btn btn-secondary btn-sm hidden" title="Chapter-only book folders ready to compile with BookTool">
+          📦 Uncompiled (<span id="uncompiledCountBadge">0</span>)
+        </button>
         <select id="libraryFolderSelect" class="select-compact" style="height: 33px; padding: 0 10px; max-width: 210px;">
           <option value="">All Drive Folders</option>
         </select>
@@ -306,8 +329,30 @@
         </div>
       </div>
 
-      <div class="iframe-container">
+      <div id="epubFrameContainer" class="iframe-container">
         <iframe id="epubFrame" class="epub-frame" title="EPUB Chapter Content"></iframe>
+      </div>
+
+      <!-- PDF.js Reading Canvas (shown when reading a PDF) -->
+      <div id="pdfViewerContainer" class="pdf-viewer-container hidden">
+        <div class="pdf-subtoolbar">
+          <div class="pdf-nav-group">
+            <button id="btnPdfPrevPage" class="btn btn-xs btn-ghost" title="Previous Page">◀</button>
+            <span class="pdf-page-indicator">
+              Page <input id="pdfPageInput" type="number" min="1" value="1" class="pdf-page-input" /> of <span id="pdfPageTotal">1</span>
+            </span>
+            <button id="btnPdfNextPage" class="btn btn-xs btn-ghost" title="Next Page">▶</button>
+          </div>
+          <div class="pdf-zoom-group">
+            <button id="btnPdfZoomOut" class="btn btn-xs btn-ghost" title="Zoom Out">−</button>
+            <span id="pdfZoomLabel" class="pdf-zoom-label">100%</span>
+            <button id="btnPdfZoomIn" class="btn btn-xs btn-ghost" title="Zoom In">+</button>
+            <button id="btnPdfFitWidth" class="btn btn-xs btn-secondary" title="Fit to Reader Width">Fit Width</button>
+          </div>
+        </div>
+        <div id="pdfPagesScroll" class="pdf-pages-scroll">
+          <div id="pdfPagesWrap" class="pdf-pages-wrap"></div>
+        </div>
       </div>
 
       <!-- Inline Endnote / Footnote Popover Card (reads notes in-place without leaving the page) -->
@@ -686,9 +731,31 @@
     </div>
   </div>
 
+  <!-- MODAL: UNCOMPILED CHAPTER-ONLY BOOK FOLDERS (BookTool Integration) -->
+  <div id="uncompiledModal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width: 660px;">
+      <div class="modal-header">
+        <h2>📦 Uncompiled Chapter-Only Book Folders</h2>
+        <button id="btnCloseUncompiled" class="btn-close-xs">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted-hint" style="margin-bottom: 12px;">
+          These folders in <strong>Cambridge Core/Books</strong> and <strong>nerd stuff</strong> only contain individual chapter PDFs (so they are kept out of your PDF shelf). Click <strong>Compile with BookTool</strong> to merge a folder into a single full-book PDF with TOC bookmarks, upload it to Drive, and add it directly to Folio.
+        </p>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:12px;">
+          <input type="text" id="uncompiledFilterInput" placeholder="Filter uncompiled folders..." style="flex:1; padding:6px 10px; font-size:13px; border:1px solid var(--border-color); border-radius:8px; background:var(--bg-app); color:var(--text-main);" />
+          <button id="btnCompileAllUncompiled" class="btn btn-primary btn-sm">⚡ Compile Visible</button>
+        </div>
+        <div id="uncompiledList" class="uncompiled-list"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast notification container -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script src="/app.js?v=4"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="/pdf_viewer.js?v=5"></script>
+  <script src="/app.js?v=5"></script>
 </body>
 </html>

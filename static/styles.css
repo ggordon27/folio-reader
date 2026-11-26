@@ -2306,3 +2306,271 @@ body.focus-mode .exit-focus-btn {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+
+/* ============================================================
+   PDF SHELF SWITCHER, UNCOMPILED BOOKS MODAL & PDF.JS VIEWER
+   ============================================================ */
+
+.library-hero-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.shelf-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
+}
+
+.shelf-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 13px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.shelf-tab:hover {
+  color: var(--text-main);
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.shelf-tab.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.shelf-count {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(128, 128, 128, 0.16);
+}
+
+.shelf-tab.active .shelf-count {
+  background: rgba(255, 255, 255, 0.24);
+  color: #fff;
+}
+
+.badge-pdf {
+  background: rgba(153, 27, 27, 0.88) !important;
+  color: #fff !important;
+}
+
+.badge-pdf-inline {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(153, 27, 27, 0.14);
+  color: #991b1b;
+  vertical-align: middle;
+}
+
+[data-theme="dark"] .badge-pdf-inline {
+  background: rgba(248, 113, 113, 0.2);
+  color: #fca5a5;
+}
+
+.placeholder-pdf {
+  background: linear-gradient(145deg, #3b1d1d 0%, #5c2626 100%) !important;
+}
+
+/* PDF Viewer Container */
+.pdf-viewer-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  background: var(--bg-app);
+}
+
+.pdf-subtoolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 14px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+
+.pdf-nav-group,
+.pdf-zoom-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pdf-page-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+}
+
+.pdf-page-input {
+  width: 52px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-app);
+  color: var(--text-main);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.pdf-zoom-label {
+  min-width: 44px;
+  text-align: center;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.pdf-pages-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding: 18px 16px 40px;
+}
+
+.pdf-pages-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.pdf-page-slot {
+  position: relative;
+  background: #ffffff;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.14);
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+[data-theme="dark"] .pdf-page-canvas {
+  filter: invert(0.88) hue-rotate(180deg);
+}
+
+[data-theme="sepia"] .pdf-page-canvas {
+  filter: sepia(0.16) contrast(0.97);
+}
+
+.pdf-page-canvas {
+  display: block;
+}
+
+.pdf-page-slot .textLayer {
+  position: absolute;
+  inset: 0;
+  opacity: 1;
+  line-height: 1;
+  pointer-events: auto;
+}
+
+.pdf-page-slot .textLayer span {
+  color: transparent;
+  cursor: text;
+}
+
+.pdf-page-slot .textLayer span.folio-pdf-hl {
+  border-radius: 2px;
+  mix-blend-mode: multiply;
+}
+
+.pdf-page-slot .textLayer span.folio-pdf-hl.hl-blue {
+  background: rgba(59, 130, 246, 0.28);
+}
+.pdf-page-slot .textLayer span.folio-pdf-hl.hl-yellow {
+  background: rgba(250, 204, 21, 0.36);
+}
+.pdf-page-slot .textLayer span.folio-pdf-hl.hl-red {
+  background: rgba(239, 68, 68, 0.28);
+}
+.pdf-page-slot .textLayer span.folio-pdf-hl.hl-green {
+  background: rgba(34, 197, 94, 0.28);
+}
+.pdf-page-slot .textLayer span.folio-pdf-hl.hl-grey {
+  background: rgba(107, 114, 128, 0.28);
+}
+
+.pdf-page-badge {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(20, 20, 20, 0.58);
+  color: #fff;
+  pointer-events: none;
+}
+
+/* Uncompiled Chapter-Only Books Modal */
+.uncompiled-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.uncompiled-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-app);
+}
+
+.uncompiled-row-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.uncompiled-row-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uncompiled-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}

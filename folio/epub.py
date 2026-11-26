@@ -409,6 +409,10 @@ def parse_epub_from_zip(epub_path: Path) -> Tuple[dict, List[Tuple[int, str, str
 def get_chapter_plain_text(book_id: str, chapter: dict) -> Tuple[str, str]:
     href = chapter.get("href", "")
     title = chapter.get("title", "")
+    if "start_page" in chapter or str(href).startswith("page:"):
+        from .pdf_reader import get_pdf_chapter_plain_text
+
+        return get_pdf_chapter_plain_text(book_id, chapter)
     res = read_epub_resource(book_id, href)
     if not res:
         return title, ""
@@ -429,13 +433,23 @@ def ensure_book_fts_indexed(book_id: str):
         conn.close()
 
     epub_path = BOOKS_DIR / book_id / "book.epub"
-    if not epub_path.is_file():
+    if epub_path.is_file():
+        try:
+            _, chapter_plain_texts = parse_epub_from_zip(epub_path)
+            index_book_chapters_fts(book_id, chapter_plain_texts)
+        except Exception as e:
+            print(f"FTS5 lazy index warning ({book_id}): {e}", file=sys.stderr)
         return
-    try:
-        _, chapter_plain_texts = parse_epub_from_zip(epub_path)
-        index_book_chapters_fts(book_id, chapter_plain_texts)
-    except Exception as e:
-        print(f"FTS5 lazy index warning ({book_id}): {e}", file=sys.stderr)
+
+    pdf_path = BOOKS_DIR / book_id / "book.pdf"
+    if pdf_path.is_file():
+        try:
+            from .pdf_reader import parse_pdf_file
+
+            _, chapter_plain_texts, _ = parse_pdf_file(pdf_path)
+            index_book_chapters_fts(book_id, chapter_plain_texts)
+        except Exception as e:
+            print(f"FTS5 lazy PDF index warning ({book_id}): {e}", file=sys.stderr)
 
 
 def search_book_passages_fts(book_id: str, query: str, max_results: int = 8) -> List[dict]:

@@ -136,6 +136,17 @@ def init_db():
                     book_json TEXT DEFAULT '',
                     hidden_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS uncompiled_folders (
+                    folder_id TEXT PRIMARY KEY,
+                    folder_name TEXT NOT NULL,
+                    folder_path TEXT DEFAULT '',
+                    chapter_count INTEGER DEFAULT 0,
+                    total_size INTEGER DEFAULT 0,
+                    source_root TEXT DEFAULT '',
+                    sample_files TEXT DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -157,6 +168,12 @@ def init_db():
                 conn.execute("ALTER TABLE books ADD COLUMN progress_percent INTEGER DEFAULT 0")
             if "has_cover" not in cols:
                 conn.execute("ALTER TABLE books ADD COLUMN has_cover INTEGER DEFAULT 0")
+            if "format" not in cols:
+                conn.execute("ALTER TABLE books ADD COLUMN format TEXT DEFAULT 'epub'")
+            if "pdf_category" not in cols:
+                conn.execute("ALTER TABLE books ADD COLUMN pdf_category TEXT DEFAULT ''")
+            if "page_count" not in cols:
+                conn.execute("ALTER TABLE books ADD COLUMN page_count INTEGER DEFAULT 0")
 
             ann_cols = {r["name"] for r in conn.execute("PRAGMA table_info(annotations)").fetchall()}
             if "page_number" not in ann_cols:

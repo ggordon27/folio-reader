@@ -10,8 +10,8 @@ from .config import HIGHLIGHT_SCHEMA
 from .db import get_setting
 
 
-def companion_filename_for(epub_name: str, ext: str = ".annotations.json") -> str:
-    stem = re.sub(r"\.epub$", "", epub_name, flags=re.IGNORECASE)
+def companion_filename_for(book_name: str, ext: str = ".annotations.json") -> str:
+    stem = re.sub(r"\.(?:epub|pdf)$", "", book_name, flags=re.IGNORECASE)
     return f"{stem}{ext}"
 
 

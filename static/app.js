@@ -43,6 +43,10 @@ const HIGHLIGHT_CATEGORIES = {
 
 const state = {
   books: [],
+  uncompiledFolders: [],
+  libraryFormat: localStorage.getItem("folio_library_format") || "epub",
+  pdfCategoryFilter: "",
+  pdfSyncedOnce: false,
   filterQuery: "",
   folderFilter: "",
   tagFilter: "",
@@ -90,6 +94,25 @@ const el = {
   libraryFolderSelect: document.getElementById("libraryFolderSelect"),
   libraryTagSelect: document.getElementById("libraryTagSelect"),
   librarySortSelect: document.getElementById("librarySortSelect"),
+  libraryHeroTitle: document.getElementById("libraryHeroTitle"),
+  libraryHeroDesc: document.getElementById("libraryHeroDesc"),
+  btnShelfEpub: document.getElementById("btnShelfEpub"),
+  btnShelfPdf: document.getElementById("btnShelfPdf"),
+  btnShelfAll: document.getElementById("btnShelfAll"),
+  epubCountPill: document.getElementById("epubCountPill"),
+  pdfCountPill: document.getElementById("pdfCountPill"),
+  allCountPill: document.getElementById("allCountPill"),
+  pdfCategorySelect: document.getElementById("pdfCategorySelect"),
+  btnOpenUncompiled: document.getElementById("btnOpenUncompiled"),
+  uncompiledCountBadge: document.getElementById("uncompiledCountBadge"),
+  uncompiledModal: document.getElementById("uncompiledModal"),
+  btnCloseUncompiled: document.getElementById("btnCloseUncompiled"),
+  uncompiledFilterInput: document.getElementById("uncompiledFilterInput"),
+  btnCompileAllUncompiled: document.getElementById("btnCompileAllUncompiled"),
+  uncompiledList: document.getElementById("uncompiledList"),
+  epubFrameContainer: document.getElementById("epubFrameContainer"),
+  pdfViewerContainer: document.getElementById("pdfViewerContainer"),
+  btnTypographyMenu: document.getElementById("btnTypographyMenu"),
   btnViewGrid: document.getElementById("btnViewGrid"),
   btnViewList: document.getElementById("btnViewList"),
   continueReadingSection: document.getElementById("continueReadingSection"),
@@ -418,22 +441,126 @@ async function saveSettings() {
 
 // --- Library View ---
 
+function getBookFormat(book) {
+  if (!book) return "epub";
+  if (book.format) return book.format.toLowerCase();
+  return (book.name || "").toLowerCase().endsWith(".pdf") ? "pdf" : "epub";
+}
+
+function isActiveBookPdf() {
+  return Boolean(state.activeBook && getBookFormat(state.activeBook) === "pdf");
+}
+
+function getBooksForCurrentShelf() {
+  if (state.libraryFormat === "all") return state.books;
+  return state.books.filter((b) => getBookFormat(b) === state.libraryFormat);
+}
+
+function updateShelfCountPills() {
+  const epubCnt = state.books.filter((b) => getBookFormat(b) === "epub").length;
+  const pdfCnt = state.books.filter((b) => getBookFormat(b) === "pdf").length;
+  if (el.epubCountPill) el.epubCountPill.textContent = String(epubCnt);
+  if (el.pdfCountPill) el.pdfCountPill.textContent = String(pdfCnt);
+  if (el.allCountPill) el.allCountPill.textContent = String(state.books.length);
+  if (el.uncompiledCountBadge) el.uncompiledCountBadge.textContent = String(state.uncompiledFolders.length);
+  if (el.btnOpenUncompiled) {
+    const showUncompiled = state.libraryFormat !== "epub" && state.uncompiledFolders.length > 0;
+    el.btnOpenUncompiled.classList.toggle("hidden", !showUncompiled);
+  }
+}
+
+async function syncPdfsFromDrive() {
+  el.libraryLoading.classList.remove("hidden");
+  el.libraryLoadingText.textContent = "Scanning Cambridge Core & nerd stuff for PDFs (filtering chapter splits)...";
+  try {
+    const res = await fetch("/api/pdfs/sync", { method: "POST" });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    state.books = data.books || state.books;
+    state.uncompiledFolders = data.uncompiled_folders || [];
+    state.pdfSyncedOnce = true;
+    updateShelfCountPills();
+    populateFolderDropdown();
+    populateTagDropdown();
+    renderLibraryGrid();
+    const msg = `Synced ${data.pdf_count} PDFs (${data.skipped_chapter_pdfs} chapter PDFs filtered, ${data.uncompiled_count} uncompiled book folders).`;
+    showToast(msg, 4500);
+  } catch (e) {
+    showToast(`PDF sync error: ${e.message}`);
+  } finally {
+    el.libraryLoading.classList.add("hidden");
+  }
+}
+
+function setLibraryFormat(fmt, opts = {}) {
+  const valid = ["epub", "pdf", "all"].includes(fmt) ? fmt : "epub";
+  state.libraryFormat = valid;
+  localStorage.setItem("folio_library_format", valid);
+  state.folderFilter = "";
+  state.pdfCategoryFilter = "";
+  if (el.pdfCategorySelect) {
+    el.pdfCategorySelect.value = "";
+    el.pdfCategorySelect.classList.toggle("hidden", valid === "epub");
+  }
+  document.querySelectorAll(".shelf-tab").forEach((btn) => {
+    const active = btn.dataset.format === valid;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  if (el.libraryHeroTitle && el.libraryHeroDesc) {
+    if (valid === "pdf") {
+      el.libraryHeroTitle.textContent = "Your Google Drive PDF Library";
+      el.libraryHeroDesc.textContent =
+        "Scoped to Cambridge Core & nerd stuff — full books, Cambridge Elements, and journal articles (chapter splits kept out of the shelf).";
+    } else if (valid === "all") {
+      el.libraryHeroTitle.textContent = "Your Full Google Drive Library";
+      el.libraryHeroDesc.textContent = "All EPUBs and PDFs together — search, highlight, compare, and discuss with Gemini.";
+    } else {
+      el.libraryHeroTitle.textContent = "Your Google Drive EPUB Library";
+      el.libraryHeroDesc.textContent =
+        "Connected to Google Drive. Select any book to download, read, highlight, annotate, and discuss with Gemini.";
+    }
+  }
+  updateShelfCountPills();
+  populateFolderDropdown();
+  populateTagDropdown();
+  renderLibraryGrid();
+
+  // First time opening PDFs shelf with 0 PDFs synced, trigger scoped PDF scan automatically
+  const pdfCount = state.books.filter((b) => getBookFormat(b) === "pdf").length;
+  if (!opts.skipAutoSync && valid === "pdf" && pdfCount === 0 && !state.pdfSyncedOnce) {
+    syncPdfsFromDrive();
+  }
+}
+
 async function fetchBooks(forceSync = false) {
+  if (forceSync && state.libraryFormat === "pdf") {
+    return syncPdfsFromDrive();
+  }
   el.libraryLoading.classList.remove("hidden");
   el.libraryLoadingText.textContent = forceSync
-    ? "Syncing latest EPUB files from your Google Drive..."
-    : "Loading your Google Drive EPUB library...";
+    ? state.libraryFormat === "all"
+      ? "Syncing EPUBs & scoped PDFs from Google Drive..."
+      : "Syncing latest EPUB files from your Google Drive..."
+    : "Loading your Google Drive library...";
   try {
-    const url = forceSync ? "/api/books/sync" : "/api/books";
+    const url = forceSync
+      ? `/api/books/sync?scope=${encodeURIComponent(state.libraryFormat === "all" ? "all" : "epub")}`
+      : "/api/books";
     const method = forceSync ? "POST" : "GET";
     const res = await fetch(url, { method });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     state.books = data.books || [];
+    state.uncompiledFolders = data.uncompiled_folders || [];
+    updateShelfCountPills();
     populateFolderDropdown();
     populateTagDropdown();
     renderLibraryGrid();
-    if (forceSync) showToast(`Synced ${state.books.length} EPUBs from Google Drive.`);
+    if (forceSync) {
+      const shelfCount = getBooksForCurrentShelf().length;
+      showToast(`Synced ${shelfCount} ${state.libraryFormat === "all" ? "items" : state.libraryFormat.toUpperCase() + "s"} from Google Drive.`);
+    }
   } catch (e) {
     showToast(`Error loading library: ${e.message}`);
   } finally {
@@ -444,7 +571,7 @@ async function fetchBooks(forceSync = false) {
 function populateFolderDropdown() {
   if (!el.libraryFolderSelect) return;
   const folderCounts = {};
-  for (const b of state.books) {
+  for (const b of getBooksForCurrentShelf()) {
     const fp = (b.folder_path || "").trim();
     if (fp) {
       folderCounts[fp] = (folderCounts[fp] || 0) + 1;
@@ -604,8 +731,8 @@ function getBookProgressInfo(book) {
 
 function renderContinueReading() {
   if (!el.continueReadingSection || !el.continueReadingRow) return;
-  const hasFilter = Boolean(state.filterQuery.trim() || state.folderFilter || state.tagFilter);
-  const recent = state.books.filter((b) => b.last_opened_at).slice(0, 8);
+  const hasFilter = Boolean(state.filterQuery.trim() || state.folderFilter || state.tagFilter || state.pdfCategoryFilter);
+  const recent = getBooksForCurrentShelf().filter((b) => b.last_opened_at).slice(0, 8);
   if (hasFilter || recent.length === 0) {
     el.continueReadingSection.classList.add("hidden");
     return;
@@ -614,11 +741,12 @@ function renderContinueReading() {
   el.continueReadingRow.innerHTML = recent
     .map((b) => {
       const prog = getBookProgressInfo(b);
+      const fmtLabel = getBookFormat(b).toUpperCase();
       return `
         <div class="continue-card" data-book-id="${escapeHtml(b.id)}">
           <div>
             <div class="continue-card-title" title="${escapeHtml(b.title || b.name)}">${escapeHtml(b.title || b.name)}</div>
-            <div class="continue-card-sub">${escapeHtml(b.author || "EPUB")}</div>
+            <div class="continue-card-sub">${escapeHtml(b.author || fmtLabel)}</div>
           </div>
           <div>
             <div class="continue-card-sub" title="${escapeHtml(prog.label)}" style="margin-bottom:4px;">${escapeHtml(prog.label)} · ${prog.pct}%</div>
@@ -680,8 +808,12 @@ function renderLibraryGrid() {
   const qNorm = q.replace(/[-_]/g, " ");
   const folderFilter = state.folderFilter;
   const tagFilter = state.tagFilter;
+  const pdfCatFilter = state.pdfCategoryFilter;
 
-  const filtered = state.books.filter((b) => {
+  const filtered = getBooksForCurrentShelf().filter((b) => {
+    if (pdfCatFilter && getBookFormat(b) === "pdf" && (b.pdf_category || "book") !== pdfCatFilter) {
+      return false;
+    }
     if (folderFilter && (b.folder_path || "") !== folderFilter) {
       return false;
     }
@@ -717,11 +849,15 @@ function renderLibraryGrid() {
   el.libraryGrid.classList.toggle("list-view", state.libraryViewMode === "list");
 
   if (filtered.length === 0) {
-    el.libraryGrid.innerHTML = `<p class="muted-hint">No matching EPUB books found.</p>`;
+    const emptyMsg =
+      state.libraryFormat === "pdf"
+        ? `No matching PDFs found. Click <strong>Refresh from Drive</strong> to scan Cambridge Core &amp; nerd stuff.`
+        : `No matching ${state.libraryFormat === "all" ? "books" : "EPUB books"} found.`;
+    el.libraryGrid.innerHTML = `<p class="muted-hint">${emptyMsg}</p>`;
     return;
   }
 
-  const visibleBooks = q || folderFilter || tagFilter ? filtered : filtered.slice(0, state.displayLimit);
+  const visibleBooks = q || folderFilter || tagFilter || pdfCatFilter ? filtered : filtered.slice(0, state.displayLimit);
 
   el.libraryGrid.innerHTML =
     visibleBooks
@@ -729,6 +865,13 @@ function renderLibraryGrid() {
         const displayTitle = book.title || book.name;
         const folderTag = book.folder_path ? `📁 ${book.folder_path}` : "";
         const authorName = (book.author || "").trim();
+        const isPdf = getBookFormat(book) === "pdf";
+        const pdfCatLabel =
+          book.pdf_category === "article"
+            ? "PDF · Article"
+            : book.pdf_category === "element"
+            ? "PDF · Element"
+            : "PDF · Book";
         const coverUrl =
           book.has_cover || (book.downloaded && book.cover_href)
             ? `/api/books/${encodeURIComponent(book.id)}/cover`
@@ -745,13 +888,16 @@ function renderLibraryGrid() {
         if (state.libraryViewMode === "list") {
           return `
           <article class="library-list-row" data-book-id="${escapeHtml(book.id)}">
-            <div class="list-row-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</div>
+            <div class="list-row-title" title="${escapeHtml(displayTitle)}">
+              ${isPdf ? `<span class="badge badge-pdf-inline">${escapeHtml(pdfCatLabel)}</span> ` : ""}
+              ${escapeHtml(displayTitle)}
+            </div>
             <div class="list-row-author" title="${escapeHtml(authorName)}">${escapeHtml(authorName || "—")}</div>
             <div class="list-row-tags">
               ${tagsHtml}
               <button type="button" class="btn-add-tag" data-book-id="${escapeHtml(book.id)}">+ Tag</button>
             </div>
-            <div class="list-row-author">${annCount > 0 ? `🖍️ ${annCount}` : ""}</div>
+            <div class="list-row-author">${annCount > 0 ? `🖍️ ${annCount}` : (isPdf && book.page_count ? `${book.page_count} pp.` : "")}</div>
             <div class="list-row-author" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;" title="${prog ? escapeHtml(prog.label) : ""}">
               <span>${prog ? `${escapeHtml(prog.label)} (${prog.pct}%)` : (book.downloaded ? "Cached" : "Drive")}</span>
               <button type="button" class="btn-remove-book btn-remove-book-inline" data-remove-book="${escapeHtml(book.id)}" title="Remove from library (stays hidden on Drive sync)">×</button>
@@ -764,15 +910,16 @@ function renderLibraryGrid() {
           <div class="book-cover-area">
             <button type="button" class="btn-remove-book" data-remove-book="${escapeHtml(book.id)}" title="Remove from library (stays hidden on Drive sync)">×</button>
             <div class="book-badge-row">
+              ${isPdf ? `<span class="badge badge-pdf">${escapeHtml(pdfCatLabel)}</span>` : ""}
               ${book.downloaded ? `<span class="badge badge-downloaded">Cached</span>` : `<span class="badge">On Drive</span>`}
               ${annCount > 0 ? `<span class="badge">🖍️ ${annCount}</span>` : ""}
             </div>
             ${
               coverUrl
                 ? `<img src="${coverUrl}" alt="${escapeHtml(displayTitle)}" loading="lazy" />`
-                : `<div class="book-cover-placeholder">
+                : `<div class="book-cover-placeholder ${isPdf ? "placeholder-pdf" : ""}">
                     <div class="placeholder-title">${escapeHtml(displayTitle)}</div>
-                    <div class="placeholder-tag">${escapeHtml(authorName ? authorName.split(",")[0] : "EPUB")}</div>
+                    <div class="placeholder-tag">${escapeHtml(authorName ? authorName.split(",")[0] : (isPdf ? pdfCatLabel : "EPUB"))}</div>
                   </div>`
             }
           </div>
@@ -780,7 +927,7 @@ function renderLibraryGrid() {
             <div>
               <h3 class="book-card-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</h3>
               <div class="book-card-author" title="${escapeHtml(authorName || folderTag)}">
-                ${authorName ? `<strong>${escapeHtml(authorName)}</strong>` : `<span style="opacity:0.75;">${escapeHtml(folderTag || "EPUB Book")}</span>`}
+                ${authorName ? `<strong>${escapeHtml(authorName)}</strong>` : `<span style="opacity:0.75;">${escapeHtml(folderTag || (isPdf ? pdfCatLabel : "EPUB Book"))}</span>`}
               </div>
               <div class="book-tags-row">
                 ${tagsHtml}
@@ -788,15 +935,15 @@ function renderLibraryGrid() {
               </div>
             </div>
             <div class="book-card-meta">
-              <span title="${escapeHtml(folderTag)}">${escapeHtml(folderTag ? folderTag.split(" / ").pop() : formatBytes(book.size))}</span>
-              <span title="${prog ? escapeHtml(prog.label) : ""}" style="max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${prog ? `${escapeHtml(prog.label)} · ${prog.pct}%` : "Open Book →"}</span>
+              <span title="${escapeHtml(folderTag)}">${escapeHtml(folderTag ? folderTag.split(" / ").pop() : formatBytes(book.size))}${isPdf && book.page_count ? ` · ${book.page_count}p` : ""}</span>
+              <span title="${prog ? escapeHtml(prog.label) : ""}" style="max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${prog ? `${escapeHtml(prog.label)} · ${prog.pct}%` : (isPdf ? "Open PDF →" : "Open Book →")}</span>
             </div>
           </div>
         </article>
       `;
       })
       .join("") +
-    (!q && !folderFilter && !tagFilter && filtered.length > state.displayLimit
+    (!q && !folderFilter && !tagFilter && !pdfCatFilter && filtered.length > state.displayLimit
       ? `<div style="grid-column: 1 / -1; text-align: center; padding: 16px;">
           <button id="btnShowMoreBooks" class="btn btn-secondary">
             Show More Books (${state.displayLimit} of ${filtered.length} shown — or use Search / Folder Filter above)
@@ -969,17 +1116,81 @@ async function openBook(bookId, opts = {}) {
 
     // Pick first substantial chapter if opening for the first time and chapter 0 is just a cover
     const chapters = (book.manifest && book.manifest.chapters) || [];
-    if (
-      typeof opts.chapterIndex !== "number" &&
-      !book.last_opened_at &&
-      state.currentChapterIndex === 0 &&
-      chapters.length > 1 &&
-      chapters[0].word_count < 30
-    ) {
-      state.currentChapterIndex = 1;
-    }
+    const isPdf = getBookFormat(book) === "pdf";
 
-    await loadChapter(state.currentChapterIndex, opts.highlightPhrase || "");
+    if (isPdf) {
+      el.epubFrameContainer?.classList.add("hidden");
+      el.pdfViewerContainer?.classList.remove("hidden");
+      if (el.btnTypographyMenu) el.btnTypographyMenu.closest(".toolbar-dropdown-wrap")?.classList.add("hidden");
+
+      const targetCh = chapters[state.currentChapterIndex] || chapters[0];
+      const pageCount = book.page_count || book.manifest?.page_count || 1;
+      let startPage = opts.pageNumber || (targetCh ? targetCh.start_page : 1) || 1;
+      if (!opts.pageNumber && typeof opts.chapterIndex !== "number" && book.scroll_percent > 0 && pageCount > 1) {
+        startPage = Math.max(1, Math.min(pageCount, Math.round(book.scroll_percent * (pageCount - 1)) + 1));
+      }
+
+      el.bookLoadingMessage.textContent = "Rendering PDF pages...";
+      const _mapPageToChapterIdx = (pno) => {
+        for (const ch of chapters) {
+          if (pno >= (ch.start_page || 1) && pno <= (ch.end_page || pageCount)) {
+            return ch.index;
+          }
+        }
+        return 0;
+      };
+
+      const debouncedPdfProgress = debounce((pno, scrollPct) => {
+        saveReadingProgress(scrollPct);
+      }, 600);
+
+      await window.FolioPdfViewer.open(
+        bookId,
+        { startPage },
+        {
+          getAnnotations: () => state.annotations,
+          onPageChange: (pno, total) => {
+            const chIdx = _mapPageToChapterIdx(pno);
+            state.currentChapterIndex = chIdx;
+            const curCh = chapters[chIdx];
+            el.headerChapterTitle.textContent = curCh ? `${curCh.title} · p. ${pno}` : `Page ${pno}`;
+            el.footerChapterProgress.textContent = `Page ${pno} of ${total}${curCh ? ` · ${curCh.title}` : ""}`;
+            el.btnPrevChapter.disabled = chIdx <= 0;
+            el.btnNextChapter.disabled = chIdx >= chapters.length - 1;
+            const bar = document.getElementById("chapterProgressBar");
+            if (bar) bar.style.width = `${Math.round((pno / Math.max(1, total)) * 100)}%`;
+            renderToc();
+          },
+          onScrollSave: (pno, scrollPct) => {
+            debouncedPdfProgress(pno, scrollPct);
+          },
+          onTextSelect: ({ text, pageNumber, pageNum }) => {
+            const chIdx = _mapPageToChapterIdx(pageNum);
+            state.currentChapterIndex = chIdx;
+            state.selectedText = text;
+            state.selectedPageNumber = pageNumber;
+            el.selectionPopover?.classList.remove("hidden");
+          },
+        }
+      );
+    } else {
+      window.FolioPdfViewer?.destroy();
+      el.pdfViewerContainer?.classList.add("hidden");
+      el.epubFrameContainer?.classList.remove("hidden");
+      if (el.btnTypographyMenu) el.btnTypographyMenu.closest(".toolbar-dropdown-wrap")?.classList.remove("hidden");
+
+      if (
+        typeof opts.chapterIndex !== "number" &&
+        !book.last_opened_at &&
+        state.currentChapterIndex === 0 &&
+        chapters.length > 1 &&
+        chapters[0].word_count < 30
+      ) {
+        state.currentChapterIndex = 1;
+      }
+
+      await loadChapter(state.currentChapterIndex, opts.highlightPhrase || "");
+    }
   } catch (e) {
     showToast(`Failed to open book: ${e.message}`);
     backToLibrary();
@@ -994,11 +1205,15 @@ function backToLibrary() {
     if (idx !== -1) {
       const chapters = state.activeBook.manifest?.chapters || [];
       const ch = chapters[state.currentChapterIndex];
-      const sp = getIframeScrollPercent();
+      const sp = isActiveBookPdf()
+        ? (window.FolioPdfViewer?.getScrollPercent() || 0)
+        : getIframeScrollPercent();
       const updated = {
         ...state.books[idx],
         downloaded: 1,
+        has_cover: state.activeBook.has_cover || state.books[idx].has_cover,
         cover_href: state.activeBook.cover_href || state.books[idx].cover_href,
+        page_count: state.activeBook.page_count || state.books[idx].page_count || 0,
         last_chapter_index: state.currentChapterIndex,
         scroll_percent: sp,
         last_chapter_title: ch?.title || state.books[idx].last_chapter_title || "",
@@ -1014,6 +1229,10 @@ function backToLibrary() {
       state.books.unshift(updated);
     }
   }
+  window.FolioPdfViewer?.destroy();
+  el.pdfViewerContainer?.classList.add("hidden");
+  el.epubFrameContainer?.classList.remove("hidden");
+  if (el.btnTypographyMenu) el.btnTypographyMenu.closest(".toolbar-dropdown-wrap")?.classList.remove("hidden");
   state.activeBook = null;
   state.selectedText = "";
   state.endnoteDocCache = {};
@@ -1023,6 +1242,7 @@ function backToLibrary() {
   el.activeBookHeader.classList.add("hidden");
   el.readerToolbar.classList.add("hidden");
   el.libraryView.classList.remove("hidden");
+  updateShelfCountPills();
   renderLibraryGrid();
 }
 
@@ -1058,6 +1278,12 @@ async function loadChapter(chapterIndex, highlightSearchPhrase = "") {
   hideEndnotePopover();
 
   const ch = chapters[chapterIndex];
+  if (isActiveBookPdf()) {
+    const startPg = ch.start_page || 1;
+    window.FolioPdfViewer?.scrollToPage(startPg);
+    renderToc();
+    return;
+  }
   el.headerChapterTitle.textContent = ch.title;
   el.footerChapterProgress.textContent = `Section ${chapterIndex + 1} of ${chapters.length} · ${ch.title}`;
   el.btnPrevChapter.disabled = chapterIndex <= 0;
@@ -2058,7 +2284,11 @@ async function saveAnnotationToServer(payload) {
     else state.annotations.push(saved);
 
     renderAnnotationsList();
-    applySavedHighlightsToIframe();
+    if (isActiveBookPdf()) {
+      window.FolioPdfViewer?.refreshHighlights();
+    } else {
+      applySavedHighlightsToIframe();
+    }
     showToast("Highlight saved locally.");
     return saved;
   } catch (e) {
@@ -2079,7 +2309,7 @@ function renderSingleAnnotationCard(ann) {
   return `
     <div class="annotation-card" data-ann-card-id="${escapeHtml(ann.id)}">
       <div class="ann-header">
-        <span class="ann-chapter-tag" data-jump-ch="${ann.chapter_index}" data-jump-text="${escapeHtml(ann.selected_text.slice(0, 60))}">
+        <span class="ann-chapter-tag" data-jump-ch="${ann.chapter_index}" data-jump-page="${escapeHtml(ann.page_number || "")}" data-jump-text="${escapeHtml(ann.selected_text.slice(0, 60))}">
           ${escapeHtml(chTitle)}${pageTag}
         </span>
         <span class="ann-cat-badge">
@@ -2190,6 +2420,15 @@ function renderAnnotationsList() {
     tag.addEventListener("click", () => {
       const chIdx = parseInt(tag.dataset.jumpCh, 10);
       const phrase = tag.dataset.jumpText;
+      if (isActiveBookPdf()) {
+        const pgMatch = (tag.dataset.jumpPage || "").match(/(\d+)/);
+        if (pgMatch) {
+          window.FolioPdfViewer?.scrollToPage(parseInt(pgMatch[1], 10));
+          return;
+        }
+        loadChapter(chIdx, phrase);
+        return;
+      }
       if (chIdx !== state.currentChapterIndex) {
         loadChapter(chIdx, phrase);
       } else {
@@ -3479,12 +3718,154 @@ function initCommandPalette() {
   });
 }
 
+// --- Shelf Format Switcher & Uncompiled Chapter-Only Books Modal (BookTool) ---
+
+function renderUncompiledList() {
+  if (!el.uncompiledList) return;
+  const q = (el.uncompiledFilterInput?.value || "").toLowerCase().trim();
+  const rows = state.uncompiledFolders.filter((f) => {
+    if (!q) return true;
+    return (
+      (f.folder_name || "").toLowerCase().includes(q) ||
+      (f.folder_path || "").toLowerCase().includes(q)
+    );
+  });
+
+  if (rows.length === 0) {
+    el.uncompiledList.innerHTML = `<p class="muted-hint">No uncompiled chapter-only book folders found.</p>`;
+    return;
+  }
+
+  el.uncompiledList.innerHTML = rows
+    .map(
+      (f) => `
+      <div class="uncompiled-row" data-folder-id="${escapeHtml(f.folder_id)}">
+        <div class="uncompiled-row-info">
+          <div class="uncompiled-row-title">${escapeHtml(f.folder_name)}</div>
+          <div class="uncompiled-row-meta">
+            <span>📁 ${escapeHtml(f.folder_path || f.source_root)}</span>
+            <span>· ${f.chapter_count} chapter PDFs (${formatBytes(f.total_size)})</span>
+          </div>
+        </div>
+        <button class="btn btn-primary btn-xs btn-compile-folder" data-compile-folder="${escapeHtml(f.folder_id)}">
+          ⚡ Compile with BookTool
+        </button>
+      </div>`
+    )
+    .join("");
+
+  el.uncompiledList.querySelectorAll("[data-compile-folder]").forEach((btn) => {
+    btn.addEventListener("click", () => compileUncompiledFolder(btn.dataset.compileFolder, btn));
+  });
+}
+
+async function compileUncompiledFolder(folderId, btnEl = null) {
+  const folder = state.uncompiledFolders.find((f) => f.folder_id === folderId);
+  const label = folder?.folder_name || folderId;
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "Compiling...";
+  }
+  try {
+    const res = await fetch(`/api/pdfs/compile/${encodeURIComponent(folderId)}`, { method: "POST" });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    state.uncompiledFolders = data.uncompiled_folders || state.uncompiledFolders.filter((f) => f.folder_id !== folderId);
+    if (data.book) {
+      const idx = state.books.findIndex((b) => b.id === data.book.id);
+      if (idx !== -1) state.books[idx] = data.book;
+      else state.books.unshift(data.book);
+    }
+    updateShelfCountPills();
+    populateFolderDropdown();
+    renderLibraryGrid();
+    renderUncompiledList();
+
+    const pages = data.compile_meta?.total_pages ? ` (${data.compile_meta.total_pages} pp.)` : "";
+    showToast(
+      `Compiled "${label}"${pages} & uploaded to Drive!`,
+      5500,
+      data.book
+        ? {
+            label: "Open PDF",
+            onClick: () => {
+              el.uncompiledModal?.classList.add("hidden");
+              openBook(data.book.id);
+            },
+          }
+        : null
+    );
+    return true;
+  } catch (e) {
+    showToast(`Failed to compile "${label}": ${e.message}`, 5000);
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = "⚡ Compile with BookTool";
+    }
+    return false;
+  }
+}
+
+async function compileVisibleUncompiled() {
+  const btns = Array.from(el.uncompiledList?.querySelectorAll("[data-compile-folder]") || []);
+  if (!btns.length) return;
+  if (!confirm(`Compile ${btns.length} chapter-only book folder(s) with BookTool and upload the full-book PDFs to Google Drive?`)) {
+    return;
+  }
+  if (el.btnCompileAllUncompiled) {
+    el.btnCompileAllUncompiled.disabled = true;
+    el.btnCompileAllUncompiled.textContent = `Compiling 0/${btns.length}...`;
+  }
+  let done = 0;
+  for (const btn of btns) {
+    const fid = btn.dataset.compileFolder;
+    await compileUncompiledFolder(fid, btn);
+    done += 1;
+    if (el.btnCompileAllUncompiled) {
+      el.btnCompileAllUncompiled.textContent = `Compiling ${done}/${btns.length}...`;
+    }
+  }
+  if (el.btnCompileAllUncompiled) {
+    el.btnCompileAllUncompiled.disabled = false;
+    el.btnCompileAllUncompiled.textContent = "⚡ Compile Visible";
+  }
+}
+
+function initPdfAndShelfControls() {
+  document.querySelectorAll(".shelf-tab").forEach((btn) => {
+    btn.addEventListener("click", () => setLibraryFormat(btn.dataset.format));
+  });
+
+  el.pdfCategorySelect?.addEventListener("change", (e) => {
+    state.pdfCategoryFilter = e.target.value;
+    renderLibraryGrid();
+  });
+
+  el.btnOpenUncompiled?.addEventListener("click", () => {
+    renderUncompiledList();
+    el.uncompiledModal?.classList.remove("hidden");
+  });
+
+  el.btnCloseUncompiled?.addEventListener("click", () => {
+    el.uncompiledModal?.classList.add("hidden");
+  });
+
+  el.uncompiledModal?.addEventListener("click", (e) => {
+    if (e.target === el.uncompiledModal) el.uncompiledModal.classList.add("hidden");
+  });
+
+  el.uncompiledFilterInput?.addEventListener("input", () => renderUncompiledList());
+  el.btnCompileAllUncompiled?.addEventListener("click", () => compileVisibleUncompiled());
+}
+
 // --- Boot ---
 (async function init() {
   applyTheme(state.theme);
   updateTypography(0, state.fontFamily);
   initEventListeners();
   initNewUiControls();
+  initPdfAndShelfControls();
   initSidebarResizers();
   initCommandPalette();
   if ("serviceWorker" in navigator) {
@@ -3509,5 +3890,6 @@ function initCommandPalette() {
     showToast("Google Drive connected via Cloud OAuth!");
     window.history.replaceState({}, "", "/");
   }
+  setLibraryFormat(state.libraryFormat, { skipAutoSync: true });
   await fetchBooks(false);
 })();
